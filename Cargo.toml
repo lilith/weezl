@@ -58,6 +58,20 @@ name = "msb8"
 harness = false
 required-features = ["std"]
 
+[[bench]]
+name = "synth"
+harness = false
+required-features = ["std"]
+
+[[bench]]
+name = "init_cost"
+harness = false
+required-features = ["std"]
+
+[[example]]
+name = "dump-synth"
+required-features = ["std"]
+
 [[example]]
 name = "lzw-compress"
 required-features = ["std"]
