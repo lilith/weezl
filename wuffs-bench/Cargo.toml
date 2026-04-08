@@ -8,6 +8,10 @@ description = "Benchmark harness comparing weezl Classic/Chunked against wuffs-v
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "profile_one"
+path = "src/bin/profile_one.rs"
+
 [dependencies]
 weezl = { path = ".." }
 
@@ -21,3 +25,8 @@ zenbench = { path = "/home/lilith/work/zen/zenbench" }
 name = "wuffs_parity"
 harness = false
 path = "benches/wuffs_parity.rs"
+
+[[bench]]
+name = "l1_effect"
+harness = false
+path = "benches/l1_effect.rs"
