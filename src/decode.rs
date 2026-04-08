@@ -1857,6 +1857,11 @@ pub(crate) struct DecodeStateTight {
     width: u8,
     /// Mask of the current width: (1 << width) - 1.
     width_mask: Code,
+    /// Derives-until-next-width-bump counter. Decremented per derive.
+    /// When it reaches 0, the width bumps and this resets to 1 << width.
+    /// Once width hits MAX_CODESIZE, this stays at u16::MAX so derive
+    /// never bumps again.
+    codes_until_bump: u16,
 
     min_size: u8,
     has_ended: bool,
@@ -1892,6 +1897,7 @@ impl DecodeStateTight {
             prev_code: end_code, // sentinel: "no previous code yet"
             width,
             width_mask: (1u16 << width) - 1,
+            codes_until_bump: (1u16 << width).saturating_sub(end_code + 1),
             min_size,
             has_ended: false,
             implicit_reset: true,
@@ -1918,11 +1924,16 @@ impl DecodeStateTight {
         self.prev_code = self.end_code;
         self.width = self.min_size + 1;
         self.width_mask = (1u16 << self.width) - 1;
+        self.codes_until_bump = (1u16 << self.width).saturating_sub(self.save_code);
     }
 
     /// Derive a new table entry: parent = prev_code, new suffix byte = `byte`.
     /// Matches the PreQ+SufQ rule: if parent's suffix is full (parent_lm1 % Q == Q-1),
     /// start a new Q-chunk; otherwise extend parent's suffix.
+    ///
+    /// Uses a `codes_until_bump` countdown to avoid a per-call width
+    /// comparison; the width-bump branch only runs once per width epoch
+    /// (~256 derives at width 9) instead of on every derive.
     #[inline(always)]
     fn derive(&mut self, byte: u8) {
         if self.save_code >= MAX_ENTRIES as Code {
@@ -1946,16 +1957,28 @@ impl DecodeStateTight {
         self.lm1s[idx] = new_lm1;
         self.save_code += 1;
 
-        // Width bump: when save_code == (1 << width), it means the next code
-        // to be assigned will exceed the current width. Bump preemptively
-        // so subsequent reads use the wider code. wuffs' trick:
-        //   width += 1 & (save_code >> width)
-        // but we also have to cap at MAX_CODESIZE.
-        if self.width < MAX_CODESIZE
-            && self.save_code >> self.width != 0
-        {
+        // Width-bump countdown: one decrement per derive, one branch that
+        // only fires at width transitions (~every 256/512/1024/2048 derives).
+        self.codes_until_bump = self.codes_until_bump.wrapping_sub(1);
+        if self.codes_until_bump == 0 {
+            self.bump_width_slow();
+        }
+    }
+
+    /// Out-of-line width bump, called from derive() only at epoch boundaries.
+    #[cold]
+    #[inline(never)]
+    fn bump_width_slow(&mut self) {
+        if self.width < MAX_CODESIZE {
             self.width += 1;
             self.width_mask = (self.width_mask << 1) | 1;
+            // Next bump distance is exactly 1 << (new_width - 1) = old 1 << width.
+            // That is, we get width - min_size doublings of the code space.
+            self.codes_until_bump = 1u16 << (self.width - 1);
+        } else {
+            // Width is maxed out. Park the counter so we never enter this
+            // branch again (until reset).
+            self.codes_until_bump = u16::MAX;
         }
     }
 
