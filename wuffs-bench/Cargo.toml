@@ -1,0 +1,23 @@
+[package]
+name = "wuffs-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Benchmark harness comparing weezl Classic/Chunked against wuffs-v0.4 C LZW decoder. Internal use only, not published."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+weezl = { path = ".." }
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+zenbench = { path = "/home/lilith/work/zen/zenbench" }
+
+[[bench]]
+name = "wuffs_parity"
+harness = false
+path = "benches/wuffs_parity.rs"

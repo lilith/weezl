@@ -1,2 +1,8 @@
 target
 Cargo.lock
+# Vendored wuffs single-file C lib used by the wuffs-parity bench harness.
+# 3.2 MB; not committed. Fetched manually from:
+#   https://raw.githubusercontent.com/google/wuffs/main/release/c/wuffs-v0.4.c
+# and placed at wuffs-bench/vendor/wuffs-v0.4.c
+wuffs-bench/vendor/*.c
+wuffs-bench/target/
