@@ -982,6 +982,11 @@ impl<C: CodeBuffer, Tab: DecodeTable, CgC: CodegenConstants> Stateful for Decode
                 // of an arbitrary count of non-resetting symbols.
                 let left_before_size_switch = size_switch_at.wrapping_sub(self.next_code);
 
+                // Hoist loop-invariant fields into locals so the compiler doesn't reload
+                // from memory on every iteration of the hot burst loop.
+                let clear_code = self.clear_code;
+                let next_code = self.next_code;
+
                 // A burst is a sequence of decodes that are completely independent of each other. This
                 // is the case if neither is an end code, a clear code, or a next code, i.e. we have
                 // all of them in the decoding table and thus known their depths, and additionally if
@@ -1005,11 +1010,10 @@ impl<C: CodeBuffer, Tab: DecodeTable, CgC: CodegenConstants> Stateful for Decode
 
                     let read_code = *b;
 
-                    // A burst code can't be special.
-                    if read_code == self.clear_code
-                        || read_code == self.end_code
-                        || read_code >= self.next_code
-                    {
+                    // A burst code can't be special. Fused check: since
+                    // end_code = clear_code + 1, `read_code - clear_code < 2`
+                    // catches both. Then one more compare for >= next_code.
+                    if read_code.wrapping_sub(clear_code) < 2 || read_code >= next_code {
                         break;
                     }
 
