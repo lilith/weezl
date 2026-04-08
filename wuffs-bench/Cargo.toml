@@ -14,6 +14,7 @@ path = "src/bin/profile_one.rs"
 
 [dependencies]
 weezl = { path = ".." }
+png = "0.17"
 
 [build-dependencies]
 cc = "1.0"

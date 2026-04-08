@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use weezl::decode::TableStrategy;
-use wuffs_bench::{decode_weezl, decode_wuffs, standard_corpus, Input};
+use wuffs_bench::{
+    decode_weezl, decode_wuffs, gb82_sc_corpus, qoi_screenshot_corpus, standard_corpus, Input,
+};
 use zenbench::prelude::*;
 
 fn bench_input(g: &mut BenchGroup, input: Arc<Input>) {
@@ -71,4 +73,28 @@ fn bench_corpus(suite: &mut Suite) {
     }
 }
 
-zenbench::main!(bench_corpus);
+fn bench_qoi(suite: &mut Suite) {
+    let corpus: Vec<Arc<Input>> = qoi_screenshot_corpus().into_iter().map(Arc::new).collect();
+    if corpus.is_empty() {
+        eprintln!("warning: qoi corpus empty (expected at /home/lilith/work/codec-corpus/qoi-benchmark/screenshot_web)");
+        return;
+    }
+    for input in corpus {
+        let group_name = format!("{}-r{:.1}", input.name, input.ratio);
+        suite.group(group_name, |g| bench_input(g, Arc::clone(&input)));
+    }
+}
+
+fn bench_sc(suite: &mut Suite) {
+    let corpus: Vec<Arc<Input>> = gb82_sc_corpus().into_iter().map(Arc::new).collect();
+    if corpus.is_empty() {
+        eprintln!("warning: sc corpus empty (expected at /home/lilith/work/codec-corpus/gb82-sc)");
+        return;
+    }
+    for input in corpus {
+        let group_name = format!("{}-r{:.1}", input.name, input.ratio);
+        suite.group(group_name, |g| bench_input(g, Arc::clone(&input)));
+    }
+}
+
+zenbench::main!(bench_corpus, bench_qoi, bench_sc);

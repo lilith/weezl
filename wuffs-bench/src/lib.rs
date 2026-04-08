@@ -168,6 +168,78 @@ pub fn standard_corpus() -> Vec<Input> {
 }
 
 // --------------------------------------------------------------------------
+// Real-world corpus loaders.
+//
+// QOI benchmark screenshots: PNGs from phoboslab's qoi-benchmark suite.
+// gb82-sc (gb82 screen-captures): PNG desktop/mobile screenshots from
+// the codec-corpus repo. Both are loaded as raw RGB byte streams and
+// LZW-encoded with literal_width=8.
+// --------------------------------------------------------------------------
+
+use std::path::Path;
+
+fn try_load_png_rgb(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    Some(buf)
+}
+
+/// Take a corpus directory of PNGs and build LZW-encoded Inputs.
+/// Skips files that fail to decode or are too small (< 16 KiB raw).
+/// Limits to `max_files` for bench runtime.
+pub fn load_png_corpus(dir: &str, tag_prefix: &'static str, max_files: usize) -> Vec<Input> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+        .collect();
+    paths.sort();
+    for path in paths.into_iter().take(max_files) {
+        let raw = match try_load_png_rgb(&path) {
+            Some(r) if r.len() >= 16 * 1024 => r,
+            _ => continue,
+        };
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        // Leak the string so we can use &'static str. Fine for bench code.
+        let static_name: &'static str = Box::leak(format!("{}/{}", tag_prefix, name).into_boxed_str());
+        out.push(Input::build(static_name, raw));
+    }
+    out
+}
+
+/// QOI screenshot_web corpus — 14 screenshots of popular websites as PNG.
+/// Typical size: 500KB - 5MB raw RGB.
+pub fn qoi_screenshot_corpus() -> Vec<Input> {
+    load_png_corpus(
+        "/home/lilith/work/codec-corpus/qoi-benchmark/screenshot_web",
+        "qoi",
+        6,
+    )
+}
+
+/// gb82-sc corpus — 10 desktop/mobile screenshots (retina, native dark, etc.)
+pub fn gb82_sc_corpus() -> Vec<Input> {
+    load_png_corpus(
+        "/home/lilith/work/codec-corpus/gb82-sc",
+        "sc",
+        6,
+    )
+}
+
+// --------------------------------------------------------------------------
 // Cross-check: run all three decoders on every input and assert byte equality.
 // --------------------------------------------------------------------------
 
