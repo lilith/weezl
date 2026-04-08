@@ -1839,9 +1839,12 @@ pub(crate) struct DecodeStateTight {
     prefixes: Box<[Code; MAX_ENTRIES]>,
     lm1s: Box<[u16; MAX_ENTRIES]>,
 
-    // Bit reader (LSB). 64-bit buffer holds up to 7 9-bit codes, so
-    // most iterations avoid refill.
-    bit_buffer: u64,
+    // Bit reader (LSB). 32-bit buffer matches wuffs, refilling via a
+    // 4-byte LE read whenever n_bits drops below the code width.
+    // Holds up to 3 9-bit or 2 12-bit codes — refills happen more often
+    // than with 64 bits, but each refill is cheaper (single u32 read +
+    // `n_bits |= 24` trick).
+    bit_buffer: u32,
     n_bits: u8,
 
     // LZW state. `prev_code == end_code` is the "no previous" sentinel
@@ -2119,32 +2122,32 @@ impl Stateful for DecodeStateTight {
         // Main decode loop: one code per iteration, wuffs-style.
         loop {
             // Refill the bit buffer if it doesn't hold enough bits for the
-            // next code. Fast path: read 8 bytes at once into the high end
-            // of the 64-bit buffer.
+            // next code. Fast path: read 4 bytes via u32 load, shift into
+            // the high end, bump n_bits by 24 (leaving the last byte to be
+            // naturally drained and re-read next time).
             if self.n_bits < self.width {
-                if inp.len() >= 8 {
-                    // Direct 8-byte read. We shift the new bytes into the
-                    // high positions so the low bits stay aligned with the
-                    // current reader state.
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&inp[..8]);
-                    let chunk = u64::from_le_bytes(bytes);
-                    // Only consume (64 - n_bits) / 8 bytes worth.
-                    let wish_bits = 64 - self.n_bits;
-                    let consume_bytes = usize::from(wish_bits / 8);
+                if inp.len() >= 4 {
+                    use core::convert::TryInto;
+                    let bytes: [u8; 4] = inp[..4].try_into().unwrap();
+                    let chunk = u32::from_le_bytes(bytes);
                     self.bit_buffer |= chunk << self.n_bits;
-                    inp = &inp[consume_bytes..];
-                    self.n_bits += (consume_bytes as u8) * 8;
+                    // Consume (31 - n_bits) / 8 + 1 bytes, same as wuffs.
+                    // For n_bits = 0..=7 that's 4 bytes; 8..=15 -> 3; 16..=23 -> 2; 24 -> 1.
+                    // Since we only enter this branch when n_bits < width <= 12,
+                    // n_bits is 0..=11, so we consume 3 or 4 bytes.
+                    let consume = ((31 - self.n_bits) >> 3) as usize;
+                    inp = &inp[consume..];
+                    // n_bits ends up in [24, 31] after this.
+                    self.n_bits |= 24;
                 } else if !inp.is_empty() {
                     // Slow path: byte-at-a-time until we have enough bits
                     // or the input is empty.
                     while self.n_bits < self.width && !inp.is_empty() {
-                        self.bit_buffer |= (inp[0] as u64) << self.n_bits;
+                        self.bit_buffer |= u32::from(inp[0]) << self.n_bits;
                         inp = &inp[1..];
                         self.n_bits += 8;
                     }
                     if self.n_bits < self.width {
-                        // Not enough bits even after draining input.
                         status = if o_in > inp.len() {
                             Ok(LzwStatus::Ok)
                         } else {
@@ -2163,7 +2166,7 @@ impl Stateful for DecodeStateTight {
             }
 
             // Extract one code (low bits of bit_buffer).
-            let code = (self.bit_buffer & u64::from(self.width_mask)) as Code;
+            let code = (self.bit_buffer & u32::from(self.width_mask)) as Code;
             self.bit_buffer >>= self.width;
             self.n_bits -= self.width;
 
@@ -2172,7 +2175,7 @@ impl Stateful for DecodeStateTight {
                 // ==== LITERAL path ====
                 if out.is_empty() {
                     // Put the bits back — we can't commit this code yet.
-                    self.bit_buffer = (self.bit_buffer << self.width) | u64::from(code);
+                    self.bit_buffer = (self.bit_buffer << self.width) | u32::from(code);
                     self.n_bits += self.width;
                     break;
                 }
