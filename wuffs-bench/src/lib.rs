@@ -178,18 +178,22 @@ mod tests {
     fn check(input: &Input) {
         let mut out_classic = vec![0u8; input.raw.len() + 64];
         let mut out_chunked = vec![0u8; input.raw.len() + 64];
+        let mut out_tight = vec![0u8; input.raw.len() + 64];
         let mut out_wuffs = vec![0u8; input.raw.len() + 64];
 
         let n1 = decode_weezl(&input.encoded, &mut out_classic, TableStrategy::Classic);
         let n2 = decode_weezl(&input.encoded, &mut out_chunked, TableStrategy::Chunked);
+        let n4 = decode_weezl(&input.encoded, &mut out_tight, TableStrategy::Tight);
         let n3 = decode_wuffs(&input.encoded, &mut out_wuffs, 8);
 
         assert_eq!(n1, input.raw.len(), "{} classic size", input.name);
         assert_eq!(n2, input.raw.len(), "{} chunked size", input.name);
+        assert_eq!(n4, input.raw.len(), "{} tight size", input.name);
         assert_eq!(n3, input.raw.len(), "{} wuffs size", input.name);
 
         assert_eq!(&out_classic[..n1], &input.raw[..], "{} classic bytes", input.name);
         assert_eq!(&out_chunked[..n2], &input.raw[..], "{} chunked bytes", input.name);
+        assert_eq!(&out_tight[..n4], &input.raw[..], "{} tight bytes", input.name);
         assert_eq!(&out_wuffs[..n3], &input.raw[..], "{} wuffs bytes", input.name);
     }
 

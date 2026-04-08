@@ -40,6 +40,17 @@ fn bench_input(g: &mut BenchGroup, input: Arc<Input>) {
         })
     });
 
+    let i4 = Arc::clone(&input);
+    g.bench(format!("tight/{}", input.name), move |b| {
+        let input = Arc::clone(&i4);
+        let mut out = vec![0u8; out_cap];
+        b.iter(move || {
+            let n = decode_weezl(&input.encoded, &mut out, TableStrategy::Tight);
+            black_box(&out[..n]);
+            n
+        })
+    });
+
     let i3 = Arc::clone(&input);
     g.bench(format!("wuffs/{}", input.name), move |b| {
         let input = Arc::clone(&i3);

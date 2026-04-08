@@ -30,3 +30,7 @@ path = "benches/wuffs_parity.rs"
 name = "l1_effect"
 harness = false
 path = "benches/l1_effect.rs"
+
+# Retain debug info in release so callgrind can annotate per line.
+[profile.release]
+debug = 1

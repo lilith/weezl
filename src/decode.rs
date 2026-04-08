@@ -207,6 +207,13 @@ pub enum TableStrategy {
     /// data where LZW produces long strings. Uses fixed-size arrays with masked
     /// indexing for zero bounds checks.
     Chunked,
+    /// wuffs-style single-code-per-iter loop with PreQ+SufQ(Q=8) table.
+    /// No burst machinery, no slice splitting. Aims for parity with
+    /// the wuffs_lzw reference decoder on literal-heavy workloads.
+    ///
+    /// Experimental: currently LSB-only, no TIFF early-change, no
+    /// yield-on-full. Falls back to panic if those options are combined.
+    Tight,
 }
 
 /// Describes the static parameters for creating a decoder.
@@ -358,6 +365,18 @@ impl Decoder {
             }
             (BitOrder::Msb, true, TableStrategy::Chunked) => {
                 make_state!(MsbBuffer, ChunkedTable, YieldOnFull)
+            }
+            (order, yield_on_full, TableStrategy::Tight) => {
+                assert!(
+                    !yield_on_full,
+                    "TableStrategy::Tight does not yet support yield_on_full"
+                );
+                assert!(
+                    !configuration.tiff,
+                    "TableStrategy::Tight does not yet support TIFF early-change"
+                );
+                Box::new(DecodeStateTight::new(configuration.size, order))
+                    as Box<dyn Stateful + Send + 'static>
             }
         }
     }
@@ -1777,6 +1796,479 @@ impl DerivationBase {
             prev: self.code,
             byte,
             first: self.first,
+        }
+    }
+}
+
+// ============================================================================
+// DecodeStateTight — wuffs-style single-code-per-iter decoder.
+//
+// Goal: match wuffs_lzw's per-code cost by eliminating every piece of
+// machinery that doesn't exist in the wuffs inner loop. Specifically:
+//
+//   * no burst peek (no [Code; BURST] array, no peek_bits loop)
+//   * no target slice array (no [&mut [u8]; BURST], no per-iter split_at_mut)
+//   * no burst reconstruct loop, no derive_burst
+//   * no per-iter is_full check — derive is guarded once per code by
+//     comparing save_code against MAX_ENTRIES
+//   * no last_decoded/cScsc bookkeeping — KwKwK reconstructs inline
+//
+// Table layout: PreQ+SufQ (Q=8), same data shape as ChunkedTable. The
+// difference is purely in the loop structure, not the table.
+//
+// Limitations (first pass):
+//   * LSB bit order only (wuffs_lzw is LSB-only too)
+//   * No TIFF early-change (wuffs_lzw has no TIFF mode either)
+//   * No YIELD_ON_FULL
+//   * No std::io::Read backpressure optimizations
+//
+// Mid-code suspension is handled via a 4 KiB `pending` buffer: when a
+// copy code's full value doesn't fit in the caller's `out` slice, we
+// reconstruct the value into `pending`, copy what fits, and stream the
+// rest on subsequent advance() calls.
+// ============================================================================
+
+const TIGHT_Q: usize = 8;
+const TIGHT_MASK: usize = MAX_ENTRIES - 1;
+
+pub(crate) struct DecodeStateTight {
+    // PreQ+SufQ table. Same shape as ChunkedTable but no firsts[] array —
+    // first-byte lookup walks the prefix chain, which is cheap when chains
+    // are short (single-byte literals skip the walk entirely).
+    suffixes: Box<[[u8; TIGHT_Q]; MAX_ENTRIES]>,
+    prefixes: Box<[Code; MAX_ENTRIES]>,
+    lm1s: Box<[u16; MAX_ENTRIES]>,
+
+    // Bit reader (LSB). 64-bit buffer holds up to 7 9-bit codes, so
+    // most iterations avoid refill.
+    bit_buffer: u64,
+    n_bits: u8,
+
+    // LZW state. `prev_code == end_code` is the "no previous" sentinel
+    // used after construction and after a clear code.
+    clear_code: Code,
+    end_code: Code,
+    /// Next slot to write when we derive. When this reaches MAX_ENTRIES,
+    /// the table is full and derive becomes a no-op.
+    save_code: Code,
+    /// Previous decoded code, for the next derive.
+    prev_code: Code,
+    /// Current code width in bits.
+    width: u8,
+    /// Mask of the current width: (1 << width) - 1.
+    width_mask: Code,
+
+    min_size: u8,
+    has_ended: bool,
+    implicit_reset: bool,
+
+    // Mid-code suspension buffer.
+    pending: Box<[u8; MAX_ENTRIES]>,
+    /// Bytes written into pending.
+    pending_len: u16,
+    /// Bytes already drained to the caller.
+    pending_off: u16,
+}
+
+impl DecodeStateTight {
+    pub(crate) fn new(min_size: u8, order: BitOrder) -> Self {
+        // LSB-only for now.
+        assert!(
+            matches!(order, BitOrder::Lsb),
+            "TableStrategy::Tight currently only supports BitOrder::Lsb"
+        );
+        let clear_code = 1u16 << u16::from(min_size);
+        let end_code = clear_code + 1;
+        let width = min_size + 1;
+        let mut state = DecodeStateTight {
+            suffixes: boxed_arr(),
+            prefixes: boxed_arr(),
+            lm1s: boxed_arr(),
+            bit_buffer: 0,
+            n_bits: 0,
+            clear_code,
+            end_code,
+            save_code: end_code + 1,
+            prev_code: end_code, // sentinel: "no previous code yet"
+            width,
+            width_mask: (1u16 << width) - 1,
+            min_size,
+            has_ended: false,
+            implicit_reset: true,
+            pending: boxed_arr(),
+            pending_len: 0,
+            pending_off: 0,
+        };
+        state.init_table();
+        state
+    }
+
+    fn init_table(&mut self) {
+        // Populate literal slots: each literal code i decodes to byte i.
+        // In PreQ+SufQ, a literal has lm1=0, suffix[0]=i, suffix[1..]=0,
+        // prefix=0 (never read because lm1/Q == 0).
+        for i in 0..(1u16 << u16::from(self.min_size)) {
+            let idx = usize::from(i) & TIGHT_MASK;
+            self.suffixes[idx] = [0u8; TIGHT_Q];
+            self.suffixes[idx][0] = i as u8;
+            self.prefixes[idx] = 0;
+            self.lm1s[idx] = 0;
+        }
+        self.save_code = self.end_code + 1;
+        self.prev_code = self.end_code;
+        self.width = self.min_size + 1;
+        self.width_mask = (1u16 << self.width) - 1;
+    }
+
+    /// Derive a new table entry: parent = prev_code, new suffix byte = `byte`.
+    /// Matches the PreQ+SufQ rule: if parent's suffix is full (parent_lm1 % Q == Q-1),
+    /// start a new Q-chunk; otherwise extend parent's suffix.
+    #[inline(always)]
+    fn derive(&mut self, byte: u8) {
+        if self.save_code >= MAX_ENTRIES as Code {
+            return;
+        }
+        let idx = usize::from(self.save_code) & TIGHT_MASK;
+        let parent = usize::from(self.prev_code) & TIGHT_MASK;
+        let parent_lm1 = self.lm1s[parent];
+        let new_lm1 = parent_lm1.wrapping_add(1);
+        let pos = (parent_lm1 as usize & (TIGHT_Q - 1)) + 1;
+
+        if pos < TIGHT_Q {
+            self.suffixes[idx] = self.suffixes[parent];
+            self.suffixes[idx][pos] = byte;
+            self.prefixes[idx] = self.prefixes[parent];
+        } else {
+            self.suffixes[idx] = [0u8; TIGHT_Q];
+            self.suffixes[idx][0] = byte;
+            self.prefixes[idx] = self.prev_code;
+        }
+        self.lm1s[idx] = new_lm1;
+        self.save_code += 1;
+
+        // Width bump: when save_code == (1 << width), it means the next code
+        // to be assigned will exceed the current width. Bump preemptively
+        // so subsequent reads use the wider code. wuffs' trick:
+        //   width += 1 & (save_code >> width)
+        // but we also have to cap at MAX_CODESIZE.
+        if self.width < MAX_CODESIZE
+            && self.save_code >> self.width != 0
+        {
+            self.width += 1;
+            self.width_mask = (self.width_mask << 1) | 1;
+        }
+    }
+
+    /// Reconstruct a code's value into `out`. `out.len()` must equal
+    /// `lm1s[code] + 1`. Walks the prefix chain in 8-byte strides, tail first.
+    ///
+    /// Takes the table arrays by explicit reference (rather than `&self`) so
+    /// the caller can simultaneously borrow `&mut self.pending` without
+    /// tripping the borrow checker.
+    ///
+    /// Uses the same chunks_exact_mut pattern as ChunkedTable::reconstruct —
+    /// verified empirically to compile to a 7-instruction loop body per
+    /// Q-chunk with a single qword load and a single qword store, no
+    /// per-iter bounds check, and no memcpy call.
+    #[inline(always)]
+    fn reconstruct_tight_into(
+        suffixes: &[[u8; TIGHT_Q]; MAX_ENTRIES],
+        prefixes: &[Code; MAX_ENTRIES],
+        code: Code,
+        out: &mut [u8],
+    ) {
+        let o = out.len();
+        let ci = usize::from(code) & TIGHT_MASK;
+        let suf = &suffixes[ci];
+
+        // Short path: whole value fits in one Q-chunk.
+        if o <= TIGHT_Q {
+            out.copy_from_slice(&suf[..o]);
+            return;
+        }
+
+        // Tail: last incomplete chunk.
+        let tail_len = ((o - 1) & (TIGHT_Q - 1)) + 1;
+        let tail_start = o - tail_len;
+        out[tail_start..].copy_from_slice(&suf[..tail_len]);
+        let mut c = prefixes[ci];
+
+        // Full 8-byte chunks, walking the prefix chain backward.
+        // chunks_exact_mut guarantees each chunk has exactly TIGHT_Q bytes,
+        // so LLVM compiles copy_from_slice to a single qword move with no
+        // bounds check. The `.rev()` walks from end to start.
+        for chunk in out[..tail_start].chunks_exact_mut(TIGHT_Q).rev() {
+            let ci = usize::from(c) & TIGHT_MASK;
+            chunk.copy_from_slice(&suffixes[ci]);
+            c = prefixes[ci];
+        }
+    }
+
+    /// Convenience wrapper that borrows `self` immutably.
+    #[inline(always)]
+    fn reconstruct_tight(&self, code: Code, out: &mut [u8]) {
+        Self::reconstruct_tight_into(&self.suffixes, &self.prefixes, code, out);
+    }
+
+    /// First byte of the value at `code` — the leftmost byte walked to
+    /// by reconstruct. For literals (lm1 == 0), this is suffix[0].
+    /// For longer values, we follow the prefix chain until we hit the
+    /// chunk containing the first byte.
+    #[inline(always)]
+    fn first_of(&self, mut code: Code) -> u8 {
+        // Walk all the way to the chain start. The root of the chain
+        // (the original literal) always has lm1 < Q, so its suffix[0]
+        // is the first byte of the entire value.
+        loop {
+            let ci = usize::from(code) & TIGHT_MASK;
+            let lm1 = self.lm1s[ci];
+            if lm1 < TIGHT_Q as u16 {
+                return self.suffixes[ci][0];
+            }
+            code = self.prefixes[ci];
+        }
+    }
+
+    /// Drain the pending buffer into `out`. Returns the number of bytes
+    /// drained. After a successful full drain, `pending_len == pending_off`
+    /// and we clear both to zero.
+    #[inline(always)]
+    fn drain_pending(&mut self, out: &mut [u8]) -> usize {
+        let avail = usize::from(self.pending_len - self.pending_off);
+        let n = avail.min(out.len());
+        let off = usize::from(self.pending_off);
+        out[..n].copy_from_slice(&self.pending[off..off + n]);
+        self.pending_off += n as u16;
+        if self.pending_off == self.pending_len {
+            self.pending_off = 0;
+            self.pending_len = 0;
+        }
+        n
+    }
+}
+
+impl Stateful for DecodeStateTight {
+    fn has_ended(&self) -> bool {
+        self.has_ended
+    }
+
+    fn restart(&mut self) {
+        self.has_ended = false;
+    }
+
+    fn reset(&mut self) {
+        self.init_table();
+        self.bit_buffer = 0;
+        self.n_bits = 0;
+        self.pending_len = 0;
+        self.pending_off = 0;
+        self.has_ended = false;
+    }
+
+    fn advance(&mut self, mut inp: &[u8], mut out: &mut [u8]) -> BufferResult {
+        if self.has_ended {
+            return BufferResult {
+                consumed_in: 0,
+                consumed_out: 0,
+                status: Ok(LzwStatus::Done),
+            };
+        }
+
+        let o_in = inp.len();
+        let o_out = out.len();
+
+        // First: drain any bytes still pending from a previously-started code.
+        if self.pending_len > 0 {
+            let n = self.drain_pending(out);
+            out = &mut out[n..];
+            if self.pending_len > 0 {
+                // Still pending — caller's out is full. Don't touch inp.
+                return BufferResult {
+                    consumed_in: 0,
+                    consumed_out: n,
+                    status: Ok(LzwStatus::Ok),
+                };
+            }
+        }
+
+        let mut status = Ok(LzwStatus::Ok);
+
+        // Main decode loop: one code per iteration, wuffs-style.
+        loop {
+            // Refill the bit buffer if it doesn't hold enough bits for the
+            // next code. Fast path: read 8 bytes at once into the high end
+            // of the 64-bit buffer.
+            if self.n_bits < self.width {
+                if inp.len() >= 8 {
+                    // Direct 8-byte read. We shift the new bytes into the
+                    // high positions so the low bits stay aligned with the
+                    // current reader state.
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&inp[..8]);
+                    let chunk = u64::from_le_bytes(bytes);
+                    // Only consume (64 - n_bits) / 8 bytes worth.
+                    let wish_bits = 64 - self.n_bits;
+                    let consume_bytes = usize::from(wish_bits / 8);
+                    self.bit_buffer |= chunk << self.n_bits;
+                    inp = &inp[consume_bytes..];
+                    self.n_bits += (consume_bytes as u8) * 8;
+                } else if !inp.is_empty() {
+                    // Slow path: byte-at-a-time until we have enough bits
+                    // or the input is empty.
+                    while self.n_bits < self.width && !inp.is_empty() {
+                        self.bit_buffer |= (inp[0] as u64) << self.n_bits;
+                        inp = &inp[1..];
+                        self.n_bits += 8;
+                    }
+                    if self.n_bits < self.width {
+                        // Not enough bits even after draining input.
+                        status = if o_in > inp.len() {
+                            Ok(LzwStatus::Ok)
+                        } else {
+                            Ok(LzwStatus::NoProgress)
+                        };
+                        break;
+                    }
+                } else {
+                    status = if o_in > inp.len() {
+                        Ok(LzwStatus::Ok)
+                    } else {
+                        Ok(LzwStatus::NoProgress)
+                    };
+                    break;
+                }
+            }
+
+            // Extract one code (low bits of bit_buffer).
+            let code = (self.bit_buffer & u64::from(self.width_mask)) as Code;
+            self.bit_buffer >>= self.width;
+            self.n_bits -= self.width;
+
+            // Dispatch.
+            if code < self.clear_code {
+                // ==== LITERAL path ====
+                if out.is_empty() {
+                    // Put the bits back — we can't commit this code yet.
+                    self.bit_buffer = (self.bit_buffer << self.width) | u64::from(code);
+                    self.n_bits += self.width;
+                    break;
+                }
+                out[0] = code as u8;
+                out = &mut out[1..];
+                if self.prev_code != self.end_code {
+                    self.derive(code as u8);
+                }
+                self.prev_code = code;
+            } else if code == self.clear_code {
+                // ==== CLEAR ====
+                self.init_table();
+                // prev_code is back to the sentinel.
+            } else if code == self.end_code {
+                // ==== END ====
+                self.has_ended = true;
+                status = Ok(LzwStatus::Done);
+                break;
+            } else if code < self.save_code {
+                // ==== COPY (known code) ====
+                if self.prev_code == self.end_code && !self.implicit_reset {
+                    status = Err(LzwError::InvalidCode);
+                    break;
+                }
+                let value_len = usize::from(self.lm1s[usize::from(code) & TIGHT_MASK]) + 1;
+
+                if value_len <= out.len() {
+                    // Direct reconstruct into caller's slice.
+                    let (target, tail) = out.split_at_mut(value_len);
+                    self.reconstruct_tight(code, target);
+                    let first = target[0];
+                    out = tail;
+                    if self.prev_code != self.end_code {
+                        self.derive(first);
+                    }
+                    self.prev_code = code;
+                } else {
+                    // Spill through pending buffer.
+                    let first = self.first_of(code);
+                    Self::reconstruct_tight_into(
+                        &self.suffixes,
+                        &self.prefixes,
+                        code,
+                        &mut self.pending[..value_len],
+                    );
+                    self.pending_len = value_len as u16;
+                    self.pending_off = 0;
+                    let n = self.drain_pending(out);
+                    out = &mut out[n..];
+                    if self.prev_code != self.end_code {
+                        self.derive(first);
+                    }
+                    self.prev_code = code;
+                    // pending still has data — caller's out is full.
+                    if self.pending_len > 0 {
+                        break;
+                    }
+                }
+            } else if code == self.save_code {
+                // ==== KwKwK (code equals the key being added) ====
+                if self.prev_code == self.end_code {
+                    status = Err(LzwError::InvalidCode);
+                    break;
+                }
+                // Value = prev value + first byte of prev value.
+                let prev_ci = usize::from(self.prev_code) & TIGHT_MASK;
+                let prev_len = usize::from(self.lm1s[prev_ci]) + 1;
+                let value_len = prev_len + 1;
+
+                if value_len <= out.len() {
+                    let (target, tail) = out.split_at_mut(value_len);
+                    // Reconstruct first; then target[0] IS the first byte of
+                    // the full value (= first byte of prev = suffix byte).
+                    // This avoids a separate O(chain) first_of() walk, which
+                    // is catastrophic on solid-color data where every code
+                    // is a KwKwK code with a long chain.
+                    Self::reconstruct_tight_into(
+                        &self.suffixes,
+                        &self.prefixes,
+                        self.prev_code,
+                        &mut target[..prev_len],
+                    );
+                    let first = target[0];
+                    target[prev_len] = first;
+                    out = tail;
+                    self.derive(first);
+                    self.prev_code = code;
+                } else {
+                    // Spill path: reconstruct into pending, read first from
+                    // pending[0] (cheap because we just wrote it).
+                    Self::reconstruct_tight_into(
+                        &self.suffixes,
+                        &self.prefixes,
+                        self.prev_code,
+                        &mut self.pending[..prev_len],
+                    );
+                    let first = self.pending[0];
+                    self.pending[prev_len] = first;
+                    self.pending_len = value_len as u16;
+                    self.pending_off = 0;
+                    let n = self.drain_pending(out);
+                    out = &mut out[n..];
+                    self.derive(first);
+                    self.prev_code = code;
+                    if self.pending_len > 0 {
+                        break;
+                    }
+                }
+            } else {
+                // Invalid code.
+                status = Err(LzwError::InvalidCode);
+                break;
+            }
+        }
+
+        BufferResult {
+            consumed_in: o_in - inp.len(),
+            consumed_out: o_out - out.len(),
+            status,
         }
     }
 }
