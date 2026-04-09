@@ -55,5 +55,3 @@ path = "benches/alloc_cost.rs"
 # Retain debug info in release so callgrind can annotate per line.
 [profile.release]
 debug = 1
-
-[[bin]]

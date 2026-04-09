@@ -1,7 +1,7 @@
 //! Real MSB + TIFF early-change bench using actual TIFF files.
 //!
 //! Decodes the LARGEST strip from each TIFF file in the corpus through
-//! Classic, Chunked, and Tight decoders, all configured as image-tiff
+//! Classic, Chunked, and Streaming decoders, all configured as image-tiff
 //! configures them: `Configuration::with_tiff_size_switch(Msb, 8)
 //! .with_table_strategy(...)`.
 //!
@@ -82,11 +82,11 @@ fn bench_input(g: &mut BenchGroup, input: Arc<TiffStrips>) {
     });
 
     let i3 = Arc::clone(&input);
-    g.bench(format!("tight/{}", input.name), move |b| {
+    g.bench(format!("streaming/{}", input.name), move |b| {
         let input = Arc::clone(&i3);
         let mut out = vec![0u8; out_cap];
         b.iter(move || {
-            let n = decode_tiff(&input.lzw_bytes, &mut out, TableStrategy::Tight);
+            let n = decode_tiff(&input.lzw_bytes, &mut out, TableStrategy::Streaming);
             black_box(&out[..n]);
             n
         })

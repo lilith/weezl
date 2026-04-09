@@ -137,12 +137,12 @@ fn bench_pattern(suite: &mut Suite, corpus_name: &str, inputs: Vec<TiffStrips>) 
         for strategy in [
             TableStrategy::Classic,
             TableStrategy::Chunked,
-            TableStrategy::Tight,
+            TableStrategy::Streaming,
         ] {
             let tag = match strategy {
                 TableStrategy::Classic => "cls",
                 TableStrategy::Chunked => "chk",
-                TableStrategy::Tight => "tgt",
+                TableStrategy::Streaming => "str",
                 _ => "?",
             };
             bench_fresh(

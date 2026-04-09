@@ -1,5 +1,5 @@
-//! Tight loop that decodes a given input N times. Designed for `perf stat`.
-//! Usage: `profile_one <classic|chunked|tight|wuffs> <input-name> <iters>`
+//! Hot loop that decodes a given input N times. Designed for `perf stat`.
+//! Usage: `profile_one <classic|chunked|streaming|wuffs> <input-name> <iters>`
 //! where <input-name> is one of: solid-4M, rle-4M, pal16-4M, rand-4M,
 //! solid-64k, pal16-64k, rand-64k.
 
@@ -11,7 +11,7 @@ fn decode(backend: &str, encoded: &[u8], out: &mut [u8]) -> usize {
     match backend {
         "classic" => decode_weezl(encoded, out, TableStrategy::Classic),
         "chunked" => decode_weezl(encoded, out, TableStrategy::Chunked),
-        "tight" => decode_weezl(encoded, out, TableStrategy::Tight),
+        "streaming" => decode_weezl(encoded, out, TableStrategy::Streaming),
         "wuffs" => decode_wuffs(encoded, out, 8),
         other => panic!("unknown backend: {}", other),
     }

@@ -176,12 +176,12 @@ fn bench_corpus_group(suite: &mut Suite, name: &str, corpus: Vec<TiffFullStrips>
         for strategy in [
             TableStrategy::Classic,
             TableStrategy::Chunked,
-            TableStrategy::Tight,
+            TableStrategy::Streaming,
         ] {
             let tag = match strategy {
                 TableStrategy::Classic => "cls",
                 TableStrategy::Chunked => "chk",
-                TableStrategy::Tight => "tgt",
+                TableStrategy::Streaming => "str",
                 _ => "?",
             };
             bench_fresh(

@@ -618,12 +618,12 @@ mod tests {
     fn check(input: &Input) {
         let mut out_classic = vec![0u8; input.raw.len() + 64];
         let mut out_chunked = vec![0u8; input.raw.len() + 64];
-        let mut out_tight = vec![0u8; input.raw.len() + 64];
+        let mut out_streaming = vec![0u8; input.raw.len() + 64];
         let mut out_wuffs = vec![0u8; input.raw.len() + 64];
 
         let n1 = decode_weezl(&input.encoded, &mut out_classic, TableStrategy::Classic);
         let n2 = decode_weezl(&input.encoded, &mut out_chunked, TableStrategy::Chunked);
-        let n4 = decode_weezl(&input.encoded, &mut out_tight, TableStrategy::Tight);
+        let n4 = decode_weezl(&input.encoded, &mut out_streaming, TableStrategy::Streaming);
         let n3 = decode_wuffs(&input.encoded, &mut out_wuffs, 8);
 
         assert_eq!(n1, input.raw.len(), "{} classic size", input.name);
@@ -633,7 +633,7 @@ mod tests {
 
         assert_eq!(&out_classic[..n1], &input.raw[..], "{} classic bytes", input.name);
         assert_eq!(&out_chunked[..n2], &input.raw[..], "{} chunked bytes", input.name);
-        assert_eq!(&out_tight[..n4], &input.raw[..], "{} tight bytes", input.name);
+        assert_eq!(&out_streaming[..n4], &input.raw[..], "{} tight bytes", input.name);
         assert_eq!(&out_wuffs[..n3], &input.raw[..], "{} wuffs bytes", input.name);
     }
 
@@ -645,10 +645,10 @@ mod tests {
     }
 
     /// Roundtrip test for MSB + TIFF early-change: encode with classic
-    /// TIFF mode, decode with Tight TIFF/MSB, assert byte equality.
+    /// TIFF mode, decode with Streaming TIFF/MSB, assert byte equality.
     /// Covers the image-tiff usage pattern.
     #[test]
-    fn tight_msb_tiff_roundtrip() {
+    fn streaming_msb_tiff_roundtrip() {
         use weezl::{encode::Encoder, BitOrder};
         let corpus = standard_corpus();
         for input in corpus.iter() {
@@ -659,7 +659,7 @@ mod tests {
 
             let mut out_classic = vec![0u8; input.raw.len() + 64];
             let mut out_chunked = vec![0u8; input.raw.len() + 64];
-            let mut out_tight = vec![0u8; input.raw.len() + 64];
+            let mut out_streaming = vec![0u8; input.raw.len() + 64];
 
             let n1 = decode_weezl_with_order(
                 &encoded,
@@ -677,39 +677,39 @@ mod tests {
             );
             let n3 = decode_weezl_with_order(
                 &encoded,
-                &mut out_tight,
-                TableStrategy::Tight,
+                &mut out_streaming,
+                TableStrategy::Streaming,
                 BitOrder::Msb,
                 true,
             );
 
             assert_eq!(n1, input.raw.len(), "{} classic", input.name);
             assert_eq!(n2, input.raw.len(), "{} chunked", input.name);
-            assert_eq!(n3, input.raw.len(), "{} tight", input.name);
+            assert_eq!(n3, input.raw.len(), "{} streaming", input.name);
 
             assert_eq!(&out_classic[..n1], &input.raw[..], "{} classic bytes", input.name);
             assert_eq!(&out_chunked[..n2], &input.raw[..], "{} chunked bytes", input.name);
-            assert_eq!(&out_tight[..n3], &input.raw[..], "{} tight/msb/tiff bytes", input.name);
+            assert_eq!(&out_streaming[..n3], &input.raw[..], "{} streaming/msb/tiff bytes", input.name);
         }
     }
 
     /// Non-TIFF MSB roundtrip (for completeness — not an image-tiff case
-    /// but exercises the Tight MSB bit reader on its own).
+    /// but exercises the Streaming MSB bit reader on its own).
     #[test]
-    fn tight_msb_non_tiff_roundtrip() {
+    fn streaming_msb_non_tiff_roundtrip() {
         use weezl::{encode::Encoder, BitOrder};
         for input in standard_corpus() {
             let encoded = Encoder::new(BitOrder::Msb, 8).encode(&input.raw).unwrap();
-            let mut out_tight = vec![0u8; input.raw.len() + 64];
+            let mut out_streaming = vec![0u8; input.raw.len() + 64];
             let n = decode_weezl_with_order(
                 &encoded,
-                &mut out_tight,
-                TableStrategy::Tight,
+                &mut out_streaming,
+                TableStrategy::Streaming,
                 BitOrder::Msb,
                 false,
             );
             assert_eq!(n, input.raw.len(), "{} tight/msb", input.name);
-            assert_eq!(&out_tight[..n], &input.raw[..], "{} tight/msb bytes", input.name);
+            assert_eq!(&out_streaming[..n], &input.raw[..], "{} tight/msb bytes", input.name);
         }
     }
 
@@ -717,7 +717,7 @@ mod tests {
     /// deliberately tiny (512-byte) output buffer, matching image-tiff's
     /// usage pattern where the caller drains the decoder in small chunks.
     #[test]
-    fn tight_yield_on_full_small_buffer() {
+    fn streaming_yield_on_full_small_buffer() {
         use weezl::{
             decode::{Configuration, TableStrategy},
             encode::Encoder,
@@ -732,7 +732,7 @@ mod tests {
 
             let mut dec = Configuration::with_tiff_size_switch(BitOrder::Msb, 8)
                 .with_yield_on_full_buffer(true)
-                .with_table_strategy(TableStrategy::Tight)
+                .with_table_strategy(TableStrategy::Streaming)
                 .build();
 
             // Decode through a small buffer in a drain loop.

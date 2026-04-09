@@ -38,11 +38,11 @@ fn bench_alloc(suite: &mut Suite) {
             })
         });
 
-        g.bench("tight/new+drop", |b| {
+        g.bench("streaming/new+drop", |b| {
             b.iter(|| {
                 let dec = Configuration::with_tiff_size_switch(BitOrder::Msb, 8)
                     .with_yield_on_full_buffer(true)
-                    .with_table_strategy(TableStrategy::Tight)
+                    .with_table_strategy(TableStrategy::Streaming)
                     .build();
                 black_box(dec);
             })
@@ -76,11 +76,11 @@ fn bench_alloc(suite: &mut Suite) {
             })
         });
 
-        g.bench("tight/reset", |b| {
+        g.bench("streaming/reset", |b| {
             b.with_input(|| {
                 Configuration::with_tiff_size_switch(BitOrder::Msb, 8)
                     .with_yield_on_full_buffer(true)
-                    .with_table_strategy(TableStrategy::Tight)
+                    .with_table_strategy(TableStrategy::Streaming)
                     .build()
             })
             .run(|mut dec| {
