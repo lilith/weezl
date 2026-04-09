@@ -39,3 +39,9 @@ name = "roundtrip_chunked"
 path = "fuzz_targets/roundtrip_chunked.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "roundtrip_all"
+path = "fuzz_targets/roundtrip_all.rs"
+test = false
+doc = false
