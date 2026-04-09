@@ -406,6 +406,7 @@ impl Decoder {
                 ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
+                state.bump_if_lowbit();
                 state as Box<dyn Stateful + Send + 'static>
             }
             (BitOrder::Lsb, true, TableStrategy::Streaming) => {
@@ -414,6 +415,7 @@ impl Decoder {
                 ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
+                state.bump_if_lowbit();
                 state as Box<dyn Stateful + Send + 'static>
             }
             (BitOrder::Msb, false, TableStrategy::Streaming) => {
@@ -422,6 +424,7 @@ impl Decoder {
                 ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
+                state.bump_if_lowbit();
                 state as Box<dyn Stateful + Send + 'static>
             }
             (BitOrder::Msb, true, TableStrategy::Streaming) => {
@@ -430,6 +433,7 @@ impl Decoder {
                 ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
+                state.bump_if_lowbit();
                 state as Box<dyn Stateful + Send + 'static>
             }
         }
@@ -2098,7 +2102,20 @@ impl<P: StreamingBitPacking, CgC: CodegenConstants> DecodeStateStreaming<P, CgC>
             pending_off: 0,
         };
         state.init_table();
+        state.bump_if_lowbit();
         state
+    }
+
+    /// Bump width once if `codes_until_bump == 0` after init, which happens
+    /// when `min_size < 2` and `save_code` already equals `1 << width`.
+    /// At most one bump is ever needed (the gap is at most 2 for min_size=0).
+    /// Placed at call sites (not inside init_table) to keep init_table's
+    /// LLVM codegen identical to the pre-change version — see weezl PR #67.
+    #[inline(always)]
+    fn bump_if_lowbit(&mut self) {
+        if self.codes_until_bump == 0 && self.width < MAX_CODESIZE {
+            self.bump_width_slow();
+        }
     }
 
     fn init_table(&mut self) {
@@ -2280,6 +2297,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
 
     fn reset(&mut self) {
         self.init_table();
+        self.bump_if_lowbit();
         self.bit_buffer = 0;
         self.n_bits = 0;
         self.pending_len = 0;
@@ -2452,6 +2470,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
             } else if code == self.clear_code {
                 // ==== CLEAR ====
                 self.init_table();
+                self.bump_if_lowbit();
                 // prev_code is back to the sentinel.
             } else if code == self.end_code {
                 // ==== END ====
