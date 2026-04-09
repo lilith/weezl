@@ -51,9 +51,25 @@ use weezl::{
 };
 
 pub fn decode_weezl(encoded: &[u8], out: &mut [u8], strategy: TableStrategy) -> usize {
-    let mut decoder = Configuration::new(BitOrder::Lsb, 8)
-        .with_table_strategy(strategy)
-        .build();
+    decode_weezl_with_order(encoded, out, strategy, BitOrder::Lsb, false)
+}
+
+pub fn decode_weezl_with_order(
+    encoded: &[u8],
+    out: &mut [u8],
+    strategy: TableStrategy,
+    order: BitOrder,
+    tiff: bool,
+) -> usize {
+    let mut decoder = if tiff {
+        Configuration::with_tiff_size_switch(order, 8)
+            .with_table_strategy(strategy)
+            .build()
+    } else {
+        Configuration::new(order, 8)
+            .with_table_strategy(strategy)
+            .build()
+    };
     let mut written = 0;
     let mut inp = encoded;
     let mut cursor = out;
@@ -273,6 +289,75 @@ mod tests {
     fn all_three_agree_on_corpus() {
         for input in standard_corpus() {
             check(&input);
+        }
+    }
+
+    /// Roundtrip test for MSB + TIFF early-change: encode with classic
+    /// TIFF mode, decode with Tight TIFF/MSB, assert byte equality.
+    /// Covers the image-tiff usage pattern.
+    #[test]
+    fn tight_msb_tiff_roundtrip() {
+        use weezl::{encode::Encoder, BitOrder};
+        let corpus = standard_corpus();
+        for input in corpus.iter() {
+            // Re-encode as MSB + TIFF early-change (image-tiff's pattern).
+            let encoded = Encoder::with_tiff_size_switch(BitOrder::Msb, 8)
+                .encode(&input.raw)
+                .unwrap();
+
+            let mut out_classic = vec![0u8; input.raw.len() + 64];
+            let mut out_chunked = vec![0u8; input.raw.len() + 64];
+            let mut out_tight = vec![0u8; input.raw.len() + 64];
+
+            let n1 = decode_weezl_with_order(
+                &encoded,
+                &mut out_classic,
+                TableStrategy::Classic,
+                BitOrder::Msb,
+                true,
+            );
+            let n2 = decode_weezl_with_order(
+                &encoded,
+                &mut out_chunked,
+                TableStrategy::Chunked,
+                BitOrder::Msb,
+                true,
+            );
+            let n3 = decode_weezl_with_order(
+                &encoded,
+                &mut out_tight,
+                TableStrategy::Tight,
+                BitOrder::Msb,
+                true,
+            );
+
+            assert_eq!(n1, input.raw.len(), "{} classic", input.name);
+            assert_eq!(n2, input.raw.len(), "{} chunked", input.name);
+            assert_eq!(n3, input.raw.len(), "{} tight", input.name);
+
+            assert_eq!(&out_classic[..n1], &input.raw[..], "{} classic bytes", input.name);
+            assert_eq!(&out_chunked[..n2], &input.raw[..], "{} chunked bytes", input.name);
+            assert_eq!(&out_tight[..n3], &input.raw[..], "{} tight/msb/tiff bytes", input.name);
+        }
+    }
+
+    /// Non-TIFF MSB roundtrip (for completeness — not an image-tiff case
+    /// but exercises the Tight MSB bit reader on its own).
+    #[test]
+    fn tight_msb_non_tiff_roundtrip() {
+        use weezl::{encode::Encoder, BitOrder};
+        for input in standard_corpus() {
+            let encoded = Encoder::new(BitOrder::Msb, 8).encode(&input.raw).unwrap();
+            let mut out_tight = vec![0u8; input.raw.len() + 64];
+            let n = decode_weezl_with_order(
+                &encoded,
+                &mut out_tight,
+                TableStrategy::Tight,
+                BitOrder::Msb,
+                false,
+            );
+            assert_eq!(n, input.raw.len(), "{} tight/msb", input.name);
+            assert_eq!(&out_tight[..n], &input.raw[..], "{} tight/msb bytes", input.name);
         }
     }
 }

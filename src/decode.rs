@@ -366,17 +366,30 @@ impl Decoder {
             (BitOrder::Msb, true, TableStrategy::Chunked) => {
                 make_state!(MsbBuffer, ChunkedTable, YieldOnFull)
             }
-            (order, yield_on_full, TableStrategy::Tight) => {
-                assert!(
-                    !yield_on_full,
-                    "TableStrategy::Tight does not yet support yield_on_full"
-                );
-                assert!(
-                    !configuration.tiff,
-                    "TableStrategy::Tight does not yet support TIFF early-change"
-                );
-                Box::new(DecodeStateTight::new(configuration.size, order))
-                    as Box<dyn Stateful + Send + 'static>
+            (BitOrder::Lsb, false, TableStrategy::Tight) => {
+                let mut state = Box::new(DecodeStateTight::<TightLsb>::new(configuration.size));
+                state.is_tiff = configuration.tiff;
+                state.init_table();
+                state as Box<dyn Stateful + Send + 'static>
+            }
+            (BitOrder::Lsb, true, TableStrategy::Tight) => {
+                // TODO: YIELD_ON_FULL monomorphization in a follow-up.
+                let mut state = Box::new(DecodeStateTight::<TightLsb>::new(configuration.size));
+                state.is_tiff = configuration.tiff;
+                state.init_table();
+                state as Box<dyn Stateful + Send + 'static>
+            }
+            (BitOrder::Msb, false, TableStrategy::Tight) => {
+                let mut state = Box::new(DecodeStateTight::<TightMsb>::new(configuration.size));
+                state.is_tiff = configuration.tiff;
+                state.init_table();
+                state as Box<dyn Stateful + Send + 'static>
+            }
+            (BitOrder::Msb, true, TableStrategy::Tight) => {
+                let mut state = Box::new(DecodeStateTight::<TightMsb>::new(configuration.size));
+                state.is_tiff = configuration.tiff;
+                state.init_table();
+                state as Box<dyn Stateful + Send + 'static>
             }
         }
     }
@@ -1831,7 +1844,112 @@ impl DerivationBase {
 const TIGHT_Q: usize = 8;
 const TIGHT_MASK: usize = MAX_ENTRIES - 1;
 
-pub(crate) struct DecodeStateTight {
+// ----- Bit packing direction (zero-cost compile-time generic) -----
+
+/// Marker trait for LSB vs MSB bit ordering. Implemented by zero-sized
+/// `Lsb` and `Msb` types whose methods get inlined away during
+/// monomorphization. Provides refill and extract primitives over a u64
+/// bit buffer; the buffer layout differs by direction but the signatures
+/// are uniform.
+pub(crate) trait TightBitPacking {
+    /// Refill the bit buffer from `inp` when `*n_bits < width`. On entry,
+    /// `inp.len() >= 8` is guaranteed.
+    fn refill_fast8(bit_buffer: &mut u64, n_bits: &mut u8, inp: &mut &[u8]);
+    /// Refill one byte at a time (slow path, near EOF).
+    fn refill_byte(bit_buffer: &mut u64, n_bits: &mut u8, byte: u8);
+    /// Extract one code from the buffer, consuming `width` bits.
+    fn extract(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, mask: u64) -> Code;
+    /// Undo an extract — put `code` back at the head of the buffer.
+    fn put_back(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, code: Code);
+}
+
+pub(crate) struct TightLsb;
+pub(crate) struct TightMsb;
+
+impl TightBitPacking for TightLsb {
+    #[inline(always)]
+    fn refill_fast8(bit_buffer: &mut u64, n_bits: &mut u8, inp: &mut &[u8]) {
+        use core::convert::TryInto;
+        let bytes: [u8; 8] = inp[..8].try_into().unwrap();
+        let chunk = u64::from_le_bytes(bytes);
+        // Shift the new chunk into the empty HIGH part of the buffer.
+        // Bits above position 64 are truncated and re-read on the next
+        // refill (iop doesn't advance past them). Mirrors wuffs' `n_bits
+        // |= 24` trick but for 64-bit buffers.
+        *bit_buffer |= chunk << *n_bits;
+        let consume = ((63 - *n_bits) >> 3) as usize;
+        *inp = &inp[consume..];
+        *n_bits |= 56;
+    }
+    #[inline(always)]
+    fn refill_byte(bit_buffer: &mut u64, n_bits: &mut u8, byte: u8) {
+        *bit_buffer |= u64::from(byte) << *n_bits;
+        *n_bits += 8;
+    }
+    #[inline(always)]
+    fn extract(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, mask: u64) -> Code {
+        let code = (*bit_buffer & mask) as Code;
+        *bit_buffer >>= width;
+        *n_bits -= width;
+        code
+    }
+    #[inline(always)]
+    fn put_back(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, code: Code) {
+        *bit_buffer = (*bit_buffer << width) | u64::from(code);
+        *n_bits += width;
+    }
+}
+
+impl TightBitPacking for TightMsb {
+    #[inline(always)]
+    fn refill_fast8(bit_buffer: &mut u64, n_bits: &mut u8, inp: &mut &[u8]) {
+        // Unlike LSB, we can't use the wuffs over-read trick: for MSB
+        // the "extra" bits would land below n_bits in the buffer's low
+        // positions, where rotate_left would pick them up as garbage.
+        //
+        // Instead, read exactly as many bytes as fit in (64 - n_bits):
+        // 0..=8 bytes depending on current n_bits. For width <= 12, we
+        // enter this branch with n_bits < 12 so wish_count is always 6..=8.
+        use core::convert::TryInto;
+        let wish_count = ((64 - *n_bits) / 8) as usize;
+        // Read wish_count bytes into the top of a temporary buffer.
+        let mut buf = [0u8; 8];
+        buf[..wish_count].copy_from_slice(&inp[..wish_count]);
+        let chunk = u64::from_be_bytes(buf);
+        // Shift the chunk right by n_bits so the valid new bits land
+        // in positions (64 - n_bits - wish_count*8) .. (64 - n_bits),
+        // i.e. immediately below the existing valid bits.
+        *bit_buffer |= chunk >> *n_bits;
+        *inp = &inp[wish_count..];
+        *n_bits += (wish_count as u8) * 8;
+    }
+    #[inline(always)]
+    fn refill_byte(bit_buffer: &mut u64, n_bits: &mut u8, byte: u8) {
+        // New byte goes BELOW existing valid bits at position (56-n_bits)..(64-n_bits).
+        *bit_buffer |= u64::from(byte) << (56 - *n_bits);
+        *n_bits += 8;
+    }
+    #[inline(always)]
+    fn extract(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, mask: u64) -> Code {
+        // Rotate the top `width` bits to the bottom, mask them out as
+        // the code, keep the rest in the buffer.
+        let rot = bit_buffer.rotate_left(u32::from(width));
+        let code = (rot & mask) as Code;
+        *bit_buffer = rot & !mask;
+        *n_bits -= width;
+        code
+    }
+    #[inline(always)]
+    fn put_back(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, code: Code) {
+        // Push the code back into the TOP of the buffer: rotate right
+        // by width (moving everything down), then OR the code into the
+        // now-vacated high bits.
+        *bit_buffer = (*bit_buffer >> width) | (u64::from(code) << (64 - width));
+        *n_bits += width;
+    }
+}
+
+pub(crate) struct DecodeStateTight<P: TightBitPacking> {
     // PreQ+SufQ table. Same shape as ChunkedTable but no firsts[] array —
     // first-byte lookup walks the prefix chain, which is cheap when chains
     // are short (single-byte literals skip the walk entirely).
@@ -1839,13 +1957,10 @@ pub(crate) struct DecodeStateTight {
     prefixes: Box<[Code; MAX_ENTRIES]>,
     lm1s: Box<[u16; MAX_ENTRIES]>,
 
-    // Bit reader (LSB). 32-bit buffer matches wuffs, refilling via a
-    // 4-byte LE read whenever n_bits drops below the code width.
-    // Holds up to 3 9-bit or 2 12-bit codes — refills happen more often
-    // than with 64 bits, but each refill is cheaper (single u32 read +
-    // `n_bits |= 24` trick).
-    bit_buffer: u32,
+    // Bit reader (64-bit, direction via P).
+    bit_buffer: u64,
     n_bits: u8,
+    _packing: core::marker::PhantomData<fn() -> P>,
 
     // LZW state. `prev_code == end_code` is the "no previous" sentinel
     // used after construction and after a clear code.
@@ -1869,6 +1984,10 @@ pub(crate) struct DecodeStateTight {
     min_size: u8,
     has_ended: bool,
     implicit_reset: bool,
+    /// TIFF early-change mode: bump width one iteration earlier.
+    /// Runtime flag (not a const generic) because it only affects the
+    /// init and bump-slow paths, not the per-code hot loop.
+    is_tiff: bool,
 
     // Mid-code suspension buffer.
     pending: Box<[u8; MAX_ENTRIES]>,
@@ -1878,32 +1997,33 @@ pub(crate) struct DecodeStateTight {
     pending_off: u16,
 }
 
-impl DecodeStateTight {
-    pub(crate) fn new(min_size: u8, order: BitOrder) -> Self {
-        // LSB-only for now.
-        assert!(
-            matches!(order, BitOrder::Lsb),
-            "TableStrategy::Tight currently only supports BitOrder::Lsb"
-        );
+impl<P: TightBitPacking> DecodeStateTight<P> {
+    pub(crate) fn new(min_size: u8) -> Self {
         let clear_code = 1u16 << u16::from(min_size);
         let end_code = clear_code + 1;
         let width = min_size + 1;
-        let mut state = DecodeStateTight {
+        let tiff_offset = 0; // is_tiff starts false; wired up by caller
+        let save_code = end_code + 1;
+        let mut state = DecodeStateTight::<P> {
             suffixes: boxed_arr(),
             prefixes: boxed_arr(),
             lm1s: boxed_arr(),
             bit_buffer: 0,
             n_bits: 0,
+            _packing: core::marker::PhantomData,
             clear_code,
             end_code,
-            save_code: end_code + 1,
+            save_code,
             prev_code: end_code, // sentinel: "no previous code yet"
             width,
             width_mask: (1u16 << width) - 1,
-            codes_until_bump: (1u16 << width).saturating_sub(end_code + 1),
+            codes_until_bump: (1u16 << width)
+                .saturating_sub(save_code)
+                .saturating_sub(tiff_offset),
             min_size,
             has_ended: false,
             implicit_reset: true,
+            is_tiff: false,
             pending: boxed_arr(),
             pending_len: 0,
             pending_off: 0,
@@ -1927,7 +2047,10 @@ impl DecodeStateTight {
         self.prev_code = self.end_code;
         self.width = self.min_size + 1;
         self.width_mask = (1u16 << self.width) - 1;
-        self.codes_until_bump = (1u16 << self.width).saturating_sub(self.save_code);
+        let tiff_offset: u16 = if self.is_tiff { 1 } else { 0 };
+        self.codes_until_bump = (1u16 << self.width)
+            .saturating_sub(self.save_code)
+            .saturating_sub(tiff_offset);
     }
 
     /// Derive a new table entry: parent = prev_code, new suffix byte = `byte`.
@@ -1969,14 +2092,18 @@ impl DecodeStateTight {
     }
 
     /// Out-of-line width bump, called from derive() only at epoch boundaries.
+    ///
+    /// Note that the TIFF early-change offset only applies to the FIRST
+    /// bump (at init time). Subsequent intervals are identical between
+    /// TIFF and non-TIFF (both are 1 << (new_width - 1)). The offset is
+    /// therefore NOT repeated here; init_table handles it once.
     #[cold]
     #[inline(never)]
     fn bump_width_slow(&mut self) {
         if self.width < MAX_CODESIZE {
             self.width += 1;
             self.width_mask = (self.width_mask << 1) | 1;
-            // Next bump distance is exactly 1 << (new_width - 1) = old 1 << width.
-            // That is, we get width - min_size doublings of the code space.
+            // Next bump distance is exactly 1 << (new_width - 1).
             self.codes_until_bump = 1u16 << (self.width - 1);
         } else {
             // Width is maxed out. Park the counter so we never enter this
@@ -2073,7 +2200,7 @@ impl DecodeStateTight {
     }
 }
 
-impl Stateful for DecodeStateTight {
+impl<P: TightBitPacking + 'static> Stateful for DecodeStateTight<P> {
     fn has_ended(&self) -> bool {
         self.has_ended
     }
@@ -2122,30 +2249,16 @@ impl Stateful for DecodeStateTight {
         // Main decode loop: one code per iteration, wuffs-style.
         loop {
             // Refill the bit buffer if it doesn't hold enough bits for the
-            // next code. Fast path: read 4 bytes via u32 load, shift into
-            // the high end, bump n_bits by 24 (leaving the last byte to be
-            // naturally drained and re-read next time).
+            // next code. Fast path: 8-byte read via P::refill_fast8.
             if self.n_bits < self.width {
-                if inp.len() >= 4 {
-                    use core::convert::TryInto;
-                    let bytes: [u8; 4] = inp[..4].try_into().unwrap();
-                    let chunk = u32::from_le_bytes(bytes);
-                    self.bit_buffer |= chunk << self.n_bits;
-                    // Consume (31 - n_bits) / 8 + 1 bytes, same as wuffs.
-                    // For n_bits = 0..=7 that's 4 bytes; 8..=15 -> 3; 16..=23 -> 2; 24 -> 1.
-                    // Since we only enter this branch when n_bits < width <= 12,
-                    // n_bits is 0..=11, so we consume 3 or 4 bytes.
-                    let consume = ((31 - self.n_bits) >> 3) as usize;
-                    inp = &inp[consume..];
-                    // n_bits ends up in [24, 31] after this.
-                    self.n_bits |= 24;
+                if inp.len() >= 8 {
+                    P::refill_fast8(&mut self.bit_buffer, &mut self.n_bits, &mut inp);
                 } else if !inp.is_empty() {
                     // Slow path: byte-at-a-time until we have enough bits
                     // or the input is empty.
                     while self.n_bits < self.width && !inp.is_empty() {
-                        self.bit_buffer |= u32::from(inp[0]) << self.n_bits;
+                        P::refill_byte(&mut self.bit_buffer, &mut self.n_bits, inp[0]);
                         inp = &inp[1..];
-                        self.n_bits += 8;
                     }
                     if self.n_bits < self.width {
                         status = if o_in > inp.len() {
@@ -2165,18 +2278,20 @@ impl Stateful for DecodeStateTight {
                 }
             }
 
-            // Extract one code (low bits of bit_buffer).
-            let code = (self.bit_buffer & u32::from(self.width_mask)) as Code;
-            self.bit_buffer >>= self.width;
-            self.n_bits -= self.width;
+            // Extract one code via the trait (LSB = low bits, MSB = rotate-left).
+            let code = P::extract(
+                &mut self.bit_buffer,
+                &mut self.n_bits,
+                self.width,
+                u64::from(self.width_mask),
+            );
 
             // Dispatch.
             if code < self.clear_code {
                 // ==== LITERAL path ====
                 if out.is_empty() {
                     // Put the bits back — we can't commit this code yet.
-                    self.bit_buffer = (self.bit_buffer << self.width) | u32::from(code);
-                    self.n_bits += self.width;
+                    P::put_back(&mut self.bit_buffer, &mut self.n_bits, self.width, code);
                     break;
                 }
                 out[0] = code as u8;
