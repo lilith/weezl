@@ -2330,45 +2330,75 @@ impl<P: TightBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful for
                 }
                 self.prev_code = code;
 
-                // MINI-BURST: if the next code is also a literal and
-                // all fast-path conditions still hold, process it
-                // inline without going through the outer-loop header
-                // (yield check, refill check, dispatch chain). This
-                // amortizes ~5 instructions per code on literal-heavy
-                // workloads (photos, random data).
+                // MINI-BURST: inline-process consecutive codes without
+                // going through the full outer-loop dispatch. Two
+                // fast paths:
+                //   a) literal (peek < clear_code): 1-byte output
+                //   b) short copy (clear_code < peek < save_code, lm1 < Q):
+                //      value fits in one Q-byte suffix chunk, no chain walk
                 //
-                // Conditions:
-                //   * enough bits buffered for another code
-                //   * out has another byte
-                //   * peeked code is < clear_code (a literal)
-                //   * derive above didn't bump the width (would require
-                //     a different mask for the peek)
-                while self.n_bits >= self.width && !out.is_empty() {
+                // Bail out on clear/end/KwKwK/invalid/long-copy, or
+                // when out doesn't have at least Q bytes of slack
+                // (needed so a short copy has room without bounds checks).
+                //
+                // prev_code != end_code is guaranteed at entry because
+                // we just wrote a literal above.
+                while self.n_bits >= self.width && out.len() >= TIGHT_Q {
                     let peek = P::peek_code(
                         self.bit_buffer,
                         self.width,
                         u64::from(self.width_mask),
                     );
-                    if peek >= self.clear_code {
+                    if peek < self.clear_code {
+                        // ---- LITERAL fast path ----
+                        let _ = P::extract(
+                            &mut self.bit_buffer,
+                            &mut self.n_bits,
+                            self.width,
+                            u64::from(self.width_mask),
+                        );
+                        out[0] = peek as u8;
+                        out = &mut out[1..];
+                        self.derive(peek as u8);
+                        self.prev_code = peek;
+                    } else if peek > self.end_code && peek < self.save_code {
+                        // ---- SHORT COPY fast path ----
+                        // Guard: peek must be strictly between end_code
+                        // and save_code (i.e., a valid existing derived
+                        // entry). This explicitly excludes clear_code
+                        // and end_code from the fast path, which would
+                        // otherwise read stale table slots.
+                        //
+                        // Only codes with lm1 < Q have their full
+                        // value in suffix[0..value_len] (no prefix
+                        // chain to walk). Photographic data with
+                        // horizontal predictor is dominated by short
+                        // copies — this is where the fast path helps.
+                        let ci = usize::from(peek) & TIGHT_MASK;
+                        let lm1 = self.lm1s[ci];
+                        if lm1 >= TIGHT_Q as u16 {
+                            break; // long copy, fall back to main dispatch
+                        }
+                        let value_len = usize::from(lm1) + 1;
+                        let _ = P::extract(
+                            &mut self.bit_buffer,
+                            &mut self.n_bits,
+                            self.width,
+                            u64::from(self.width_mask),
+                        );
+                        // Safe: out.len() >= TIGHT_Q >= value_len.
+                        let suf = &self.suffixes[ci];
+                        for i in 0..value_len {
+                            out[i] = suf[i];
+                        }
+                        let first = suf[0];
+                        out = &mut out[value_len..];
+                        self.derive(first);
+                        self.prev_code = peek;
+                    } else {
+                        // clear / end / KwKwK / invalid — full dispatch
                         break;
                     }
-                    // Commit the peeked literal.
-                    let _ = P::extract(
-                        &mut self.bit_buffer,
-                        &mut self.n_bits,
-                        self.width,
-                        u64::from(self.width_mask),
-                    );
-                    out[0] = peek as u8;
-                    out = &mut out[1..];
-                    // prev_code != end_code is guaranteed here because
-                    // we JUST wrote a literal above.
-                    self.derive(peek as u8);
-                    self.prev_code = peek;
-                    // derive() may have bumped self.width via
-                    // bump_width_slow(). If so, the local `width_mask`
-                    // in the next peek call (which re-reads self.width
-                    // and self.width_mask) picks up the new values.
                 }
             } else if code == self.clear_code {
                 // ==== CLEAR ====
