@@ -1868,6 +1868,9 @@ pub(crate) trait TightBitPacking {
     fn extract(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, mask: u64) -> Code;
     /// Undo an extract — put `code` back at the head of the buffer.
     fn put_back(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, code: Code);
+    /// Peek the next code without consuming it. Used by the mini-burst
+    /// fast path to speculatively check for consecutive literals.
+    fn peek_code(bit_buffer: u64, width: u8, mask: u64) -> Code;
 }
 
 pub(crate) struct TightLsb;
@@ -1904,6 +1907,10 @@ impl TightBitPacking for TightLsb {
     fn put_back(bit_buffer: &mut u64, n_bits: &mut u8, width: u8, code: Code) {
         *bit_buffer = (*bit_buffer << width) | u64::from(code);
         *n_bits += width;
+    }
+    #[inline(always)]
+    fn peek_code(bit_buffer: u64, _width: u8, mask: u64) -> Code {
+        (bit_buffer & mask) as Code
     }
 }
 
@@ -1952,6 +1959,13 @@ impl TightBitPacking for TightMsb {
         // now-vacated high bits.
         *bit_buffer = (*bit_buffer >> width) | (u64::from(code) << (64 - width));
         *n_bits += width;
+    }
+    #[inline(always)]
+    fn peek_code(bit_buffer: u64, width: u8, mask: u64) -> Code {
+        // MSB extract is a rotate-left by width then mask; peek is the
+        // same minus the state mutation. LLVM elides the temporary.
+        let rot = bit_buffer.rotate_left(u32::from(width));
+        (rot & mask) as Code
     }
 }
 
@@ -2315,6 +2329,47 @@ impl<P: TightBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful for
                     self.derive(code as u8);
                 }
                 self.prev_code = code;
+
+                // MINI-BURST: if the next code is also a literal and
+                // all fast-path conditions still hold, process it
+                // inline without going through the outer-loop header
+                // (yield check, refill check, dispatch chain). This
+                // amortizes ~5 instructions per code on literal-heavy
+                // workloads (photos, random data).
+                //
+                // Conditions:
+                //   * enough bits buffered for another code
+                //   * out has another byte
+                //   * peeked code is < clear_code (a literal)
+                //   * derive above didn't bump the width (would require
+                //     a different mask for the peek)
+                while self.n_bits >= self.width && !out.is_empty() {
+                    let peek = P::peek_code(
+                        self.bit_buffer,
+                        self.width,
+                        u64::from(self.width_mask),
+                    );
+                    if peek >= self.clear_code {
+                        break;
+                    }
+                    // Commit the peeked literal.
+                    let _ = P::extract(
+                        &mut self.bit_buffer,
+                        &mut self.n_bits,
+                        self.width,
+                        u64::from(self.width_mask),
+                    );
+                    out[0] = peek as u8;
+                    out = &mut out[1..];
+                    // prev_code != end_code is guaranteed here because
+                    // we JUST wrote a literal above.
+                    self.derive(peek as u8);
+                    self.prev_code = peek;
+                    // derive() may have bumped self.width via
+                    // bump_width_slow(). If so, the local `width_mask`
+                    // in the next peek call (which re-reads self.width
+                    // and self.width_mask) picks up the new values.
+                }
             } else if code == self.clear_code {
                 // ==== CLEAR ====
                 self.init_table();
