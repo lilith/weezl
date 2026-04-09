@@ -547,4 +547,59 @@ mod tests {
             assert_eq!(&out_tight[..n], &input.raw[..], "{} tight/msb bytes", input.name);
         }
     }
+
+    /// Exercise the yield_on_full_buffer path by decoding with a
+    /// deliberately tiny (512-byte) output buffer, matching image-tiff's
+    /// usage pattern where the caller drains the decoder in small chunks.
+    #[test]
+    fn tight_yield_on_full_small_buffer() {
+        use weezl::{
+            decode::{Configuration, TableStrategy},
+            encode::Encoder,
+            BitOrder,
+        };
+
+        for input in standard_corpus() {
+            // Use the real image-tiff pattern: with_tiff_size_switch + yield_on_full.
+            let encoded = Encoder::with_tiff_size_switch(BitOrder::Msb, 8)
+                .encode(&input.raw)
+                .unwrap();
+
+            let mut dec = Configuration::with_tiff_size_switch(BitOrder::Msb, 8)
+                .with_yield_on_full_buffer(true)
+                .with_table_strategy(TableStrategy::Tight)
+                .build();
+
+            // Decode through a small buffer in a drain loop.
+            let mut collected = Vec::with_capacity(input.raw.len());
+            let mut small_buf = vec![0u8; 512];
+            let mut inp_slice: &[u8] = &encoded;
+            let mut rounds = 0;
+            loop {
+                rounds += 1;
+                if rounds > 100_000 {
+                    panic!("{}: too many rounds, probably infinite loop", input.name);
+                }
+                let r = dec.decode_bytes(inp_slice, &mut small_buf);
+                inp_slice = &inp_slice[r.consumed_in..];
+                collected.extend_from_slice(&small_buf[..r.consumed_out]);
+                match r.status.expect("decode error") {
+                    LzwStatus::Done => break,
+                    LzwStatus::NoProgress => break,
+                    LzwStatus::Ok => {
+                        if inp_slice.is_empty() && r.consumed_out == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                collected.len(),
+                input.raw.len(),
+                "{} yield/tight size",
+                input.name
+            );
+            assert_eq!(&collected[..], &input.raw[..], "{} yield/tight bytes", input.name);
+        }
+    }
 }

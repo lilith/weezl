@@ -136,8 +136,19 @@ trait CodeBuffer {
     fn code_size(&self) -> u8;
 }
 
-trait CodegenConstants {
+pub(crate) trait CodegenConstants {
     const YIELD_ON_FULL: bool;
+}
+
+pub(crate) struct NoYield;
+pub(crate) struct YieldOnFull;
+
+impl CodegenConstants for NoYield {
+    const YIELD_ON_FULL: bool = false;
+}
+
+impl CodegenConstants for YieldOnFull {
+    const YIELD_ON_FULL: bool = true;
 }
 
 struct DecodeState<CodeBuffer, Tab: DecodeTable, Constants: CodegenConstants> {
@@ -318,17 +329,6 @@ impl Decoder {
     }
 
     fn from_configuration(configuration: &Configuration) -> Box<dyn Stateful + Send + 'static> {
-        struct NoYield;
-        struct YieldOnFull;
-
-        impl CodegenConstants for NoYield {
-            const YIELD_ON_FULL: bool = false;
-        }
-
-        impl CodegenConstants for YieldOnFull {
-            const YIELD_ON_FULL: bool = true;
-        }
-
         macro_rules! make_state {
             ($buf:ty, $tab:ty, $cgc:ty) => {{
                 let mut state = Box::new(DecodeState::<$buf, $tab, $cgc>::new(configuration.size));
@@ -367,26 +367,33 @@ impl Decoder {
                 make_state!(MsbBuffer, ChunkedTable, YieldOnFull)
             }
             (BitOrder::Lsb, false, TableStrategy::Tight) => {
-                let mut state = Box::new(DecodeStateTight::<TightLsb>::new(configuration.size));
+                let mut state = Box::new(DecodeStateTight::<TightLsb, NoYield>::new(
+                    configuration.size,
+                ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
                 state as Box<dyn Stateful + Send + 'static>
             }
             (BitOrder::Lsb, true, TableStrategy::Tight) => {
-                // TODO: YIELD_ON_FULL monomorphization in a follow-up.
-                let mut state = Box::new(DecodeStateTight::<TightLsb>::new(configuration.size));
+                let mut state = Box::new(DecodeStateTight::<TightLsb, YieldOnFull>::new(
+                    configuration.size,
+                ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
                 state as Box<dyn Stateful + Send + 'static>
             }
             (BitOrder::Msb, false, TableStrategy::Tight) => {
-                let mut state = Box::new(DecodeStateTight::<TightMsb>::new(configuration.size));
+                let mut state = Box::new(DecodeStateTight::<TightMsb, NoYield>::new(
+                    configuration.size,
+                ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
                 state as Box<dyn Stateful + Send + 'static>
             }
             (BitOrder::Msb, true, TableStrategy::Tight) => {
-                let mut state = Box::new(DecodeStateTight::<TightMsb>::new(configuration.size));
+                let mut state = Box::new(DecodeStateTight::<TightMsb, YieldOnFull>::new(
+                    configuration.size,
+                ));
                 state.is_tiff = configuration.tiff;
                 state.init_table();
                 state as Box<dyn Stateful + Send + 'static>
@@ -1910,7 +1917,6 @@ impl TightBitPacking for TightMsb {
         // Instead, read exactly as many bytes as fit in (64 - n_bits):
         // 0..=8 bytes depending on current n_bits. For width <= 12, we
         // enter this branch with n_bits < 12 so wish_count is always 6..=8.
-        use core::convert::TryInto;
         let wish_count = ((64 - *n_bits) / 8) as usize;
         // Read wish_count bytes into the top of a temporary buffer.
         let mut buf = [0u8; 8];
@@ -1949,7 +1955,7 @@ impl TightBitPacking for TightMsb {
     }
 }
 
-pub(crate) struct DecodeStateTight<P: TightBitPacking> {
+pub(crate) struct DecodeStateTight<P: TightBitPacking, CgC: CodegenConstants> {
     // PreQ+SufQ table. Same shape as ChunkedTable but no firsts[] array —
     // first-byte lookup walks the prefix chain, which is cheap when chains
     // are short (single-byte literals skip the walk entirely).
@@ -1960,7 +1966,7 @@ pub(crate) struct DecodeStateTight<P: TightBitPacking> {
     // Bit reader (64-bit, direction via P).
     bit_buffer: u64,
     n_bits: u8,
-    _packing: core::marker::PhantomData<fn() -> P>,
+    _packing: core::marker::PhantomData<fn() -> (P, CgC)>,
 
     // LZW state. `prev_code == end_code` is the "no previous" sentinel
     // used after construction and after a clear code.
@@ -1997,14 +2003,14 @@ pub(crate) struct DecodeStateTight<P: TightBitPacking> {
     pending_off: u16,
 }
 
-impl<P: TightBitPacking> DecodeStateTight<P> {
+impl<P: TightBitPacking, CgC: CodegenConstants> DecodeStateTight<P, CgC> {
     pub(crate) fn new(min_size: u8) -> Self {
         let clear_code = 1u16 << u16::from(min_size);
         let end_code = clear_code + 1;
         let width = min_size + 1;
         let tiff_offset = 0; // is_tiff starts false; wired up by caller
         let save_code = end_code + 1;
-        let mut state = DecodeStateTight::<P> {
+        let mut state = DecodeStateTight::<P, CgC> {
             suffixes: boxed_arr(),
             prefixes: boxed_arr(),
             lm1s: boxed_arr(),
@@ -2200,7 +2206,7 @@ impl<P: TightBitPacking> DecodeStateTight<P> {
     }
 }
 
-impl<P: TightBitPacking + 'static> Stateful for DecodeStateTight<P> {
+impl<P: TightBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful for DecodeStateTight<P, CgC> {
     fn has_ended(&self) -> bool {
         self.has_ended
     }
@@ -2248,6 +2254,15 @@ impl<P: TightBitPacking + 'static> Stateful for DecodeStateTight<P> {
 
         // Main decode loop: one code per iteration, wuffs-style.
         loop {
+            // yield_on_full: if the caller wants to stop as soon as the
+            // output is full and we've already written something this
+            // call, return immediately without attempting another code.
+            // The bit buffer still holds whatever bits we had, so the
+            // next advance() call resumes cleanly.
+            if CgC::YIELD_ON_FULL && out.is_empty() {
+                break;
+            }
+
             // Refill the bit buffer if it doesn't hold enough bits for the
             // next code. Fast path: 8-byte read via P::refill_fast8.
             if self.n_bits < self.width {
@@ -2328,7 +2343,11 @@ impl<P: TightBitPacking + 'static> Stateful for DecodeStateTight<P> {
                     }
                     self.prev_code = code;
                 } else {
-                    // Spill through pending buffer.
+                    // value_len > out.len(): spill through pending so we
+                    // can partially fill out this call and drain the rest
+                    // on the next advance(). yield_on_full mode ALSO
+                    // spills — the yield behavior is in the top-of-loop
+                    // check which breaks as soon as out is fully drained.
                     let first = self.first_of(code);
                     Self::reconstruct_tight_into(
                         &self.suffixes,
