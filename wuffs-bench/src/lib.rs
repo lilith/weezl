@@ -256,6 +256,179 @@ pub fn gb82_sc_corpus() -> Vec<Input> {
 }
 
 // --------------------------------------------------------------------------
+// Real TIFF-LZW strip extraction.
+//
+// The bench above synthetically LZW-encodes raw RGB bytes via weezl's
+// own encoder. That's correct, but doesn't exercise the exact bit layout
+// produced by real TIFF writers (libtiff, imagemagick, etc.). For real
+// coverage we want to load actual .tif files with COMPRESSION_LZW=5 from
+// disk and feed the LZW strip bytes directly to the decoder.
+//
+// Minimal TIFF parser: reads the 8-byte header, first IFD, pulls out
+// StripOffsets (tag 273), StripByteCounts (tag 279), and ImageLength
+// (tag 257) / SamplesPerPixel (tag 277) / BitsPerSample (tag 258) /
+// ImageWidth (tag 256) — enough to compute the expected uncompressed
+// size. Concatenates all strip bytes into one buffer (for single-strip
+// and multi-strip files both). Assumes little-endian ("II") for now.
+// --------------------------------------------------------------------------
+
+pub struct TiffStrips {
+    pub name: &'static str,
+    pub lzw_bytes: Vec<u8>,
+    /// Expected raw (decompressed) size = width * rows_per_strip * samples * (bits/8).
+    /// This is used as the output buffer size for the bench.
+    pub decompressed_size: usize,
+}
+
+/// Returns the LARGEST single strip from a TIFF file, as a self-contained
+/// LZW stream. Each TIFF strip is an independent LZW sequence with its own
+/// clear code at the start, so strips can't be concatenated into one stream.
+/// We take the largest so that the bench sees a reasonable-sized input.
+pub fn parse_tiff_lzw_strips(path: &std::path::Path) -> Option<(Vec<u8>, usize)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let le = match &bytes[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16_at = |i: usize| -> u16 {
+        if le { u16::from_le_bytes([bytes[i], bytes[i + 1]]) }
+        else  { u16::from_be_bytes([bytes[i], bytes[i + 1]]) }
+    };
+    let u32_at = |i: usize| -> u32 {
+        if le { u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) }
+        else  { u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) }
+    };
+    if u16_at(2) != 42 { return None; }
+    let ifd_off = u32_at(4) as usize;
+    if ifd_off + 2 > bytes.len() { return None; }
+    let n_entries = u16_at(ifd_off) as usize;
+    let entries_off = ifd_off + 2;
+
+    let mut compression = 0u16;
+    let mut strip_offsets: Vec<u32> = Vec::new();
+    let mut strip_byte_counts: Vec<u32> = Vec::new();
+    let mut width = 0u32;
+    let mut bits_per_sample = 8u32;
+    let mut samples_per_pixel = 1u32;
+    let mut rows_per_strip = u32::MAX;
+
+    for i in 0..n_entries {
+        let entry_off = entries_off + i * 12;
+        if entry_off + 12 > bytes.len() { return None; }
+        let tag = u16_at(entry_off);
+        let field_type = u16_at(entry_off + 2);
+        let count = u32_at(entry_off + 4) as usize;
+        let value_off = entry_off + 8;
+
+        let read_values = |type_: u16, n: usize, val_off: usize| -> Vec<u32> {
+            let elem_size = match type_ {
+                1 => 1, 3 => 2, 4 => 4, _ => return Vec::new(),
+            };
+            let total = n * elem_size;
+            let data_off = if total <= 4 { val_off } else { u32_at(val_off) as usize };
+            if data_off + total > bytes.len() { return Vec::new(); }
+            (0..n).map(|k| match type_ {
+                1 => bytes[data_off + k] as u32,
+                3 => u16_at(data_off + k * 2) as u32,
+                4 => u32_at(data_off + k * 4),
+                _ => 0,
+            }).collect()
+        };
+
+        match tag {
+            256 => width = read_values(field_type, 1, value_off)[0],
+            258 => bits_per_sample = read_values(field_type, 1, value_off).get(0).copied().unwrap_or(8),
+            259 => compression = read_values(field_type, 1, value_off)[0] as u16,
+            273 => strip_offsets = read_values(field_type, count, value_off),
+            277 => samples_per_pixel = read_values(field_type, 1, value_off).get(0).copied().unwrap_or(1),
+            278 => rows_per_strip = read_values(field_type, 1, value_off).get(0).copied().unwrap_or(u32::MAX),
+            279 => strip_byte_counts = read_values(field_type, count, value_off),
+            _ => {}
+        }
+    }
+
+    if compression != 5 { return None; }
+    if strip_offsets.is_empty() || strip_offsets.len() != strip_byte_counts.len() { return None; }
+
+    // Find the LARGEST strip (by decoded size).
+    let mut best: Option<(usize, u32, u32)> = None; // (idx, offset, byte_count)
+    for (i, (&off, &n)) in strip_offsets.iter().zip(strip_byte_counts.iter()).enumerate() {
+        if off as usize + n as usize > bytes.len() { return None; }
+        match best {
+            None => best = Some((i, off, n)),
+            Some((_, _, bn)) if n > bn => best = Some((i, off, n)),
+            _ => {}
+        }
+    }
+    let (_, off, n) = best?;
+    let lzw = bytes[off as usize..(off + n) as usize].to_vec();
+    // Decompressed size of one strip = width * rows_per_strip * samples * bits/8.
+    // rows_per_strip is capped by image height; for single-strip files this is
+    // the whole image. We don't check image height here — just trust the tag.
+    let decompressed = (width as usize)
+        * (rows_per_strip as usize).min(65536) // sanity cap
+        * (samples_per_pixel as usize)
+        * (bits_per_sample as usize / 8).max(1);
+    Some((lzw, decompressed))
+}
+
+pub fn load_lzw_tiff_corpus(dir: &str, tag_prefix: &'static str) -> Vec<TiffStrips> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let ext = p.extension().and_then(|e| e.to_str());
+            ext == Some("tif") || ext == Some("tiff")
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        if let Some((lzw, decompressed_size)) = parse_tiff_lzw_strips(&path) {
+            if lzw.len() < 1024 || decompressed_size < 4096 {
+                continue;
+            }
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let leaked: &'static str = Box::leak(format!("{}/{}", tag_prefix, name).into_boxed_str());
+            out.push(TiffStrips {
+                name: leaked,
+                lzw_bytes: lzw,
+                decompressed_size,
+            });
+        }
+    }
+    out
+}
+
+/// Real TIFF files from the tiff-conformance corpus (codec-corpus).
+pub fn tiff_conformance_lzw() -> Vec<TiffStrips> {
+    load_lzw_tiff_corpus(
+        "/home/lilith/work/codec-corpus/tiff-conformance/valid",
+        "conform",
+    )
+}
+
+/// LZW TIFFs converted from the QOI screenshot_web PNG corpus via
+/// `convert -compress lzw`. Generated to /tmp/tiff_corpus/qoi at bench
+/// setup time (see README or the convert script).
+pub fn qoi_as_lzw_tiff() -> Vec<TiffStrips> {
+    load_lzw_tiff_corpus("/tmp/tiff_corpus/qoi", "qoi-tif")
+}
+
+/// LZW TIFFs converted from the gb82-sc corpus.
+pub fn sc_as_lzw_tiff() -> Vec<TiffStrips> {
+    load_lzw_tiff_corpus("/tmp/tiff_corpus/sc", "sc-tif")
+}
+
+// --------------------------------------------------------------------------
 // Cross-check: run all three decoders on every input and assert byte equality.
 // --------------------------------------------------------------------------
 
