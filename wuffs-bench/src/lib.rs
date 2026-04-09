@@ -428,6 +428,20 @@ pub fn sc_as_lzw_tiff() -> Vec<TiffStrips> {
     load_lzw_tiff_corpus("/tmp/tiff_corpus/sc", "sc-tif")
 }
 
+/// LZW TIFFs from CLIC2025 photographic corpus WITH horizontal predictor
+/// (imagemagick's default for `-compress lzw`). This is what most real
+/// photographic TIFF-LZW files look like in the wild.
+pub fn clic_as_lzw_tiff_pred() -> Vec<TiffStrips> {
+    load_lzw_tiff_corpus("/tmp/tiff_corpus/clic", "clic-pred")
+}
+
+/// LZW TIFFs from CLIC2025 WITHOUT predictor (`tiff:predictor=1`). Models
+/// pathological "raw photographic data passed straight to LZW" where
+/// compression ratio is near 1.0 and most codes are short.
+pub fn clic_as_lzw_tiff_nopred() -> Vec<TiffStrips> {
+    load_lzw_tiff_corpus("/tmp/tiff_corpus/clic-nopred", "clic-raw")
+}
+
 // --------------------------------------------------------------------------
 // Cross-check: run all three decoders on every input and assert byte equality.
 // --------------------------------------------------------------------------

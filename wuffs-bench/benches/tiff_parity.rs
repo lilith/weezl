@@ -13,7 +13,10 @@ use weezl::{
     decode::{Configuration, TableStrategy},
     BitOrder, LzwStatus,
 };
-use wuffs_bench::{qoi_as_lzw_tiff, sc_as_lzw_tiff, tiff_conformance_lzw, TiffStrips};
+use wuffs_bench::{
+    clic_as_lzw_tiff_nopred, clic_as_lzw_tiff_pred, qoi_as_lzw_tiff, sc_as_lzw_tiff,
+    tiff_conformance_lzw, TiffStrips,
+};
 use zenbench::prelude::*;
 
 fn decode_tiff(encoded: &[u8], out: &mut [u8], strategy: TableStrategy) -> usize {
@@ -115,6 +118,8 @@ fn bench_tiff(suite: &mut Suite) {
     bench_group_from_corpus(suite, tiff_conformance_lzw(), "conform");
     bench_group_from_corpus(suite, qoi_as_lzw_tiff(), "qoi");
     bench_group_from_corpus(suite, sc_as_lzw_tiff(), "sc");
+    bench_group_from_corpus(suite, clic_as_lzw_tiff_pred(), "clic-p");
+    bench_group_from_corpus(suite, clic_as_lzw_tiff_nopred(), "clic-r");
 }
 
 zenbench::main!(bench_tiff);
