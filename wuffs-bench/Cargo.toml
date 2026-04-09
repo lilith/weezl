@@ -42,6 +42,16 @@ name = "reset_reuse"
 harness = false
 path = "benches/reset_reuse.rs"
 
+[[bench]]
+name = "full_image"
+harness = false
+path = "benches/full_image.rs"
+
+[[bench]]
+name = "alloc_cost"
+harness = false
+path = "benches/alloc_cost.rs"
+
 # Retain debug info in release so callgrind can annotate per line.
 [profile.release]
 debug = 1

@@ -280,6 +280,21 @@ pub struct TiffStrips {
     pub decompressed_size: usize,
 }
 
+/// Full multi-strip view of a TIFF file: every strip's LZW bytes as its
+/// own self-contained stream, plus the per-strip decompressed row count
+/// and pixel dimensions so callers can mimic image-tiff's exact strip-
+/// by-strip decode pattern (image-tiff/src/decoder/image.rs:1149).
+pub struct TiffFullStrips {
+    pub name: &'static str,
+    pub strips: Vec<Vec<u8>>,
+    /// Bytes per strip row = width * samples_per_pixel * (bits_per_sample/8).
+    pub row_bytes: usize,
+    /// Rows per full-width strip (except possibly the last strip).
+    pub rows_per_strip: usize,
+    /// Total decompressed bytes across all strips.
+    pub total_decompressed: usize,
+}
+
 /// Returns the LARGEST single strip from a TIFF file, as a self-contained
 /// LZW stream. Each TIFF strip is an independent LZW sequence with its own
 /// clear code at the start, so strips can't be concatenated into one stream.
@@ -414,6 +429,156 @@ pub fn tiff_conformance_lzw() -> Vec<TiffStrips> {
         "/home/lilith/work/codec-corpus/tiff-conformance/valid",
         "conform",
     )
+}
+
+/// Parse a TIFF file's IFD and return ALL strips as independent LZW
+/// streams, plus enough metadata to compute each strip's decompressed
+/// size. Returns None if the file isn't LZW-compressed classic TIFF.
+pub fn parse_tiff_all_strips(path: &std::path::Path) -> Option<TiffFullStrips> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let le = match &bytes[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16_at = |i: usize| -> u16 {
+        if le { u16::from_le_bytes([bytes[i], bytes[i + 1]]) }
+        else  { u16::from_be_bytes([bytes[i], bytes[i + 1]]) }
+    };
+    let u32_at = |i: usize| -> u32 {
+        if le { u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) }
+        else  { u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) }
+    };
+    if u16_at(2) != 42 { return None; }
+    let ifd_off = u32_at(4) as usize;
+    if ifd_off + 2 > bytes.len() { return None; }
+    let n_entries = u16_at(ifd_off) as usize;
+    let entries_off = ifd_off + 2;
+
+    let mut compression = 0u16;
+    let mut strip_offsets: Vec<u32> = Vec::new();
+    let mut strip_byte_counts: Vec<u32> = Vec::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut bits_per_sample = 8u32;
+    let mut samples_per_pixel = 1u32;
+    let mut rows_per_strip = u32::MAX;
+
+    for i in 0..n_entries {
+        let entry_off = entries_off + i * 12;
+        if entry_off + 12 > bytes.len() { return None; }
+        let tag = u16_at(entry_off);
+        let field_type = u16_at(entry_off + 2);
+        let count = u32_at(entry_off + 4) as usize;
+        let value_off = entry_off + 8;
+
+        let read_values = |type_: u16, n: usize, val_off: usize| -> Vec<u32> {
+            let elem_size = match type_ {
+                1 => 1, 3 => 2, 4 => 4, _ => return Vec::new(),
+            };
+            let total = n * elem_size;
+            let data_off = if total <= 4 { val_off } else { u32_at(val_off) as usize };
+            if data_off + total > bytes.len() { return Vec::new(); }
+            (0..n).map(|k| match type_ {
+                1 => bytes[data_off + k] as u32,
+                3 => u16_at(data_off + k * 2) as u32,
+                4 => u32_at(data_off + k * 4),
+                _ => 0,
+            }).collect()
+        };
+
+        match tag {
+            256 => width = read_values(field_type, 1, value_off)[0],
+            257 => height = read_values(field_type, 1, value_off)[0],
+            258 => bits_per_sample = read_values(field_type, 1, value_off).get(0).copied().unwrap_or(8),
+            259 => compression = read_values(field_type, 1, value_off)[0] as u16,
+            273 => strip_offsets = read_values(field_type, count, value_off),
+            277 => samples_per_pixel = read_values(field_type, 1, value_off).get(0).copied().unwrap_or(1),
+            278 => rows_per_strip = read_values(field_type, 1, value_off).get(0).copied().unwrap_or(u32::MAX),
+            279 => strip_byte_counts = read_values(field_type, count, value_off),
+            _ => {}
+        }
+    }
+
+    if compression != 5 { return None; }
+    if strip_offsets.is_empty() || strip_offsets.len() != strip_byte_counts.len() { return None; }
+
+    let mut strips: Vec<Vec<u8>> = Vec::with_capacity(strip_offsets.len());
+    for (&off, &n) in strip_offsets.iter().zip(strip_byte_counts.iter()) {
+        let o = off as usize;
+        let nn = n as usize;
+        if o + nn > bytes.len() { return None; }
+        strips.push(bytes[o..o + nn].to_vec());
+    }
+
+    let bps = (bits_per_sample / 8).max(1) as usize;
+    let row_bytes = (width as usize) * (samples_per_pixel as usize) * bps;
+    let total_decompressed = (width as usize)
+        * (height as usize)
+        * (samples_per_pixel as usize)
+        * bps;
+
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+    let leaked: &'static str = Box::leak(name.into_boxed_str());
+
+    Some(TiffFullStrips {
+        name: leaked,
+        strips,
+        row_bytes,
+        rows_per_strip: rows_per_strip as usize,
+        total_decompressed,
+    })
+}
+
+pub fn load_multi_strip_corpus(dir: &str) -> Vec<TiffFullStrips> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let ext = p.extension().and_then(|e| e.to_str());
+            ext == Some("tif") || ext == Some("tiff")
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        if let Some(f) = parse_tiff_all_strips(&path) {
+            // Skip degenerate files
+            if f.strips.len() >= 1 && f.total_decompressed >= 1024 {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// All strips from all clic2025 photographic TIFFs, full image size.
+pub fn clic_full_strips() -> Vec<TiffFullStrips> {
+    load_multi_strip_corpus("/tmp/tiff_corpus/clic")
+}
+
+/// All strips from all QOI web screenshot TIFFs.
+pub fn qoi_full_strips() -> Vec<TiffFullStrips> {
+    load_multi_strip_corpus("/tmp/tiff_corpus/qoi")
+}
+
+/// All strips from all gb82-sc screenshot TIFFs.
+pub fn sc_full_strips() -> Vec<TiffFullStrips> {
+    load_multi_strip_corpus("/tmp/tiff_corpus/sc")
+}
+
+/// All strips from the tiff-conformance LZW corpus. Many of these
+/// have tiny strips (< 2 KB) which maximize the per-strip init cost
+/// as a fraction of decode time.
+pub fn conform_full_strips() -> Vec<TiffFullStrips> {
+    load_multi_strip_corpus("/home/lilith/work/codec-corpus/tiff-conformance/valid")
 }
 
 /// LZW TIFFs converted from the QOI screenshot_web PNG corpus via
