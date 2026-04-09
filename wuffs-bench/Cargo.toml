@@ -37,6 +37,11 @@ name = "tiff_parity"
 harness = false
 path = "benches/tiff_parity.rs"
 
+[[bench]]
+name = "reset_reuse"
+harness = false
+path = "benches/reset_reuse.rs"
+
 # Retain debug info in release so callgrind can annotate per line.
 [profile.release]
 debug = 1
