@@ -2286,7 +2286,9 @@ impl<P: StreamingBitPacking, CgC: CodegenConstants> DecodeStateStreaming<P, CgC>
     }
 }
 
-impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful for DecodeStateStreaming<P, CgC> {
+impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
+    for DecodeStateStreaming<P, CgC>
+{
     fn has_ended(&self) -> bool {
         self.has_ended
     }
@@ -2411,11 +2413,8 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 // prev_code != end_code is guaranteed at entry because
                 // we just wrote a literal above.
                 while self.n_bits >= self.width && out.len() >= STREAMING_Q {
-                    let peek = P::peek_code(
-                        self.bit_buffer,
-                        self.width,
-                        u64::from(self.width_mask),
-                    );
+                    let peek =
+                        P::peek_code(self.bit_buffer, self.width, u64::from(self.width_mask));
                     if peek < self.clear_code {
                         // ---- LITERAL fast path ----
                         let _ = P::extract(

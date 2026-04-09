@@ -175,7 +175,8 @@ fn assert_parity(
             // Streaming succeeded where Classic failed — acceptable if
             // Streaming's output matches the original data.
             assert_eq!(
-                data, &s[..],
+                data,
+                &s[..],
                 "Classic failed ({}) but Streaming produced wrong output ({} bytes) \
                  (order={:?} size={} tiff={} yield={} buf={} datalen={})",
                 ce,

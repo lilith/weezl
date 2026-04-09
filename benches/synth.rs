@@ -88,11 +88,7 @@ fn run_once(encoded: &[u8], outbuf: &mut [u8], strategy: TableStrategy) -> usize
     written
 }
 
-fn bench_one(
-    c: &mut Criterion,
-    tag: &'static str,
-    decoded: Vec<u8>,
-) {
+fn bench_one(c: &mut Criterion, tag: &'static str, decoded: Vec<u8>) {
     let encoded = encode(&decoded);
     let ratio = decoded.len() as f64 / encoded.len() as f64;
     let mut outbuf = vec![0u8; decoded.len() + 1024];

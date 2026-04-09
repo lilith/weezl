@@ -38,9 +38,7 @@ pub fn bench_init(c: &mut Criterion) {
     });
 
     // 16-byte input — still init-dominated.
-    let encoded = Encoder::new(BitOrder::Msb, 8)
-        .encode(&[0u8; 16])
-        .unwrap();
+    let encoded = Encoder::new(BitOrder::Msb, 8).encode(&[0u8; 16]).unwrap();
     let mut outbuf = [0u8; 64];
     c.bench_function("init/classic/16byte", |b| {
         b.iter(|| decode_trivial(&encoded, &mut outbuf, TableStrategy::Classic))
