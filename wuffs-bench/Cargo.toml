@@ -57,5 +57,3 @@ path = "benches/alloc_cost.rs"
 debug = 1
 
 [[bin]]
-name = "debug_mini"
-path = "src/bin/debug_mini.rs"
