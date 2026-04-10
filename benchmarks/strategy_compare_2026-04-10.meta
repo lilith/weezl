@@ -1,0 +1,9 @@
+commit: 50e56c6388db7a7e64d69bd67cbf241e1eec35e8
+branch: combined-strategies
+command: cargo bench --bench strategy_compare -- --format=csv
+hardware: AMD Ryzen 9 7950X, 128GB DDR5
+rustc: stable (no -C target-cpu=native)
+date: 2026-04-10
+notes: All three strategies (Classic, Chunked, Streaming) on synthetic
+  archetype workloads fitted to real corpus data via K-means + Nelder-Mead.
+  Streaming includes the copy_within KwKwK optimization.
