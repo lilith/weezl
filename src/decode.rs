@@ -1868,7 +1868,7 @@ impl DerivationBase {
 //   * no burst reconstruct loop, no derive_burst
 //   * no per-iter is_full check — derive is guarded once per code by
 //     comparing save_code against MAX_ENTRIES
-//   * no last_decoded/cScSc bookkeeping — KwKwK reconstructs inline
+//   * KwKwK uses copy_within from previous output (memcpy, not chain walk)
 //
 // Table layout: PreQ+SufQ (Q=8), PreQ+SufQ(Q=8) table layout from the Wuffs LZW README. The
 // difference is purely in the loop structure, not the table.
@@ -2306,7 +2306,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
         self.has_ended = false;
     }
 
-    fn advance(&mut self, mut inp: &[u8], mut out: &mut [u8]) -> BufferResult {
+    fn advance(&mut self, mut inp: &[u8], out: &mut [u8]) -> BufferResult {
         if self.has_ended {
             return BufferResult {
                 consumed_in: 0,
@@ -2317,11 +2317,23 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
 
         let o_in = inp.len();
         let o_out = out.len();
+        // Write cursor into `out`. Using a cursor instead of shrinking
+        // the slice lets the KwKwK path read previously-written data via
+        // copy_within — the key optimization for solid-color data.
+        let mut wr: usize = 0;
+
+        // Track the previous code's output position in `out` so the
+        // KwKwK path can memcpy instead of walking the table chain.
+        // prev_wr_len == 0 means "not available" (prev went to pending,
+        // or we're at the start of the call).
+        let mut prev_wr_start: usize = 0;
+        let mut prev_wr_len: usize = 0;
 
         // First: drain any bytes still pending from a previously-started code.
         if self.pending_len > 0 {
-            let n = self.drain_pending(out);
-            out = &mut out[n..];
+            let n = self.drain_pending(&mut out[wr..]);
+            wr += n;
+            prev_wr_len = 0; // prev was from a prior advance() call
             if self.pending_len > 0 {
                 // Still pending — caller's out is full. Don't touch inp.
                 return BufferResult {
@@ -2341,7 +2353,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
             // call, return immediately without attempting another code.
             // The bit buffer still holds whatever bits we had, so the
             // next advance() call resumes cleanly.
-            if CgC::YIELD_ON_FULL && out.is_empty() {
+            if CgC::YIELD_ON_FULL && wr >= o_out {
                 break;
             }
 
@@ -2386,13 +2398,15 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
             // Dispatch.
             if code < self.clear_code {
                 // ==== LITERAL path ====
-                if out.is_empty() {
+                if wr >= o_out {
                     // Put the bits back — we can't commit this code yet.
                     P::put_back(&mut self.bit_buffer, &mut self.n_bits, self.width, code);
                     break;
                 }
-                out[0] = code as u8;
-                out = &mut out[1..];
+                prev_wr_start = wr;
+                prev_wr_len = 1;
+                out[wr] = code as u8;
+                wr += 1;
                 if self.prev_code != self.end_code {
                     self.derive(code as u8);
                 }
@@ -2411,7 +2425,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 //
                 // prev_code != end_code is guaranteed at entry because
                 // we just wrote a literal above.
-                while self.n_bits >= self.width && out.len() >= STREAMING_Q {
+                while self.n_bits >= self.width && o_out - wr >= STREAMING_Q {
                     let peek =
                         P::peek_code(self.bit_buffer, self.width, u64::from(self.width_mask));
                     if peek < self.clear_code {
@@ -2422,23 +2436,14 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                             self.width,
                             u64::from(self.width_mask),
                         );
-                        out[0] = peek as u8;
-                        out = &mut out[1..];
+                        prev_wr_start = wr;
+                        prev_wr_len = 1;
+                        out[wr] = peek as u8;
+                        wr += 1;
                         self.derive(peek as u8);
                         self.prev_code = peek;
                     } else if peek > self.end_code && peek < self.save_code {
                         // ---- SHORT COPY fast path ----
-                        // Guard: peek must be strictly between end_code
-                        // and save_code (i.e., a valid existing derived
-                        // entry). This explicitly excludes clear_code
-                        // and end_code from the fast path, which would
-                        // otherwise read stale table slots.
-                        //
-                        // Only codes with lm1 < Q have their full
-                        // value in suffix[0..value_len] (no prefix
-                        // chain to walk). Photographic data with
-                        // horizontal predictor is dominated by short
-                        // copies — this is where the fast path helps.
                         let ci = usize::from(peek) & STREAMING_MASK;
                         let lm1 = self.lm1s[ci];
                         if lm1 >= STREAMING_Q as u16 {
@@ -2451,13 +2456,13 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                             self.width,
                             u64::from(self.width_mask),
                         );
-                        // Safe: out.len() >= STREAMING_Q >= value_len.
+                        // Safe: o_out - wr >= STREAMING_Q >= value_len.
                         let suf = &self.suffixes[ci];
-                        for i in 0..value_len {
-                            out[i] = suf[i];
-                        }
+                        out[wr..wr + value_len].copy_from_slice(&suf[..value_len]);
                         let first = suf[0];
-                        out = &mut out[value_len..];
+                        prev_wr_start = wr;
+                        prev_wr_len = value_len;
+                        wr += value_len;
                         self.derive(first);
                         self.prev_code = peek;
                     } else {
@@ -2469,7 +2474,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 // ==== CLEAR ====
                 self.init_table();
                 self.bump_if_lowbit();
-                // prev_code is back to the sentinel.
+                prev_wr_len = 0; // invalidate — prev_code reset to sentinel
             } else if code == self.end_code {
                 // ==== END ====
                 self.has_ended = true;
@@ -2483,22 +2488,21 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 }
                 let value_len = usize::from(self.lm1s[usize::from(code) & STREAMING_MASK]) + 1;
 
-                if value_len <= out.len() {
+                if value_len <= o_out - wr {
                     // Direct reconstruct into caller's slice.
-                    let (target, tail) = out.split_at_mut(value_len);
-                    self.reconstruct_streaming(code, target);
-                    let first = target[0];
-                    out = tail;
+                    self.reconstruct_streaming(code, &mut out[wr..wr + value_len]);
+                    let first = out[wr];
+                    prev_wr_start = wr;
+                    prev_wr_len = value_len;
+                    wr += value_len;
                     if self.prev_code != self.end_code {
                         self.derive(first);
                     }
                     self.prev_code = code;
                 } else {
-                    // value_len > out.len(): spill through pending so we
+                    // value_len > remaining: spill through pending so we
                     // can partially fill out this call and drain the rest
-                    // on the next advance(). yield_on_full mode ALSO
-                    // spills — the yield behavior is in the top-of-loop
-                    // check which breaks as soon as out is fully drained.
+                    // on the next advance().
                     let first = self.first_of(code);
                     Self::reconstruct_streaming_into(
                         &self.suffixes,
@@ -2508,13 +2512,13 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                     );
                     self.pending_len = value_len as u16;
                     self.pending_off = 0;
-                    let n = self.drain_pending(out);
-                    out = &mut out[n..];
+                    let n = self.drain_pending(&mut out[wr..]);
+                    wr += n;
+                    prev_wr_len = 0; // went to pending
                     if self.prev_code != self.end_code {
                         self.derive(first);
                     }
                     self.prev_code = code;
-                    // pending still has data — caller's out is full.
                     if self.pending_len > 0 {
                         break;
                     }
@@ -2530,39 +2534,57 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 let prev_len = usize::from(self.lm1s[prev_ci]) + 1;
                 let value_len = prev_len + 1;
 
-                if value_len <= out.len() {
-                    let (target, tail) = out.split_at_mut(value_len);
-                    // Reconstruct first; then target[0] IS the first byte of
-                    // the full value (= first byte of prev = suffix byte).
-                    // This avoids a separate O(chain) first_of() walk, which
-                    // is catastrophic on solid-color data where every code
-                    // is a KwKwK code with a long chain.
-                    Self::reconstruct_streaming_into(
-                        &self.suffixes,
-                        &self.prefixes,
-                        self.prev_code,
-                        &mut target[..prev_len],
-                    );
-                    let first = target[0];
-                    target[prev_len] = first;
-                    out = tail;
+                if value_len <= o_out - wr {
+                    if prev_wr_len > 0 {
+                        // Fast path: the previous code's output is still in
+                        // this call's `out` buffer at prev_wr_start. Copy it
+                        // forward with copy_within (a single memcpy from L1-hot
+                        // data) instead of walking the table chain.
+                        // The source [prev_wr_start..prev_wr_start+prev_len]
+                        // and dest [wr..wr+prev_len] are non-overlapping
+                        // because wr >= prev_wr_start + prev_wr_len.
+                        out.copy_within(prev_wr_start..prev_wr_start + prev_len, wr);
+                    } else {
+                        // Slow path: prev code was from a prior advance() call
+                        // or went to pending — reconstruct from the table.
+                        Self::reconstruct_streaming_into(
+                            &self.suffixes,
+                            &self.prefixes,
+                            self.prev_code,
+                            &mut out[wr..wr + prev_len],
+                        );
+                    }
+                    let first = out[wr];
+                    out[wr + prev_len] = first;
+                    prev_wr_start = wr;
+                    prev_wr_len = value_len;
+                    wr += value_len;
                     self.derive(first);
                     self.prev_code = code;
                 } else {
                     // Spill path: reconstruct into pending, read first from
                     // pending[0] (cheap because we just wrote it).
-                    Self::reconstruct_streaming_into(
-                        &self.suffixes,
-                        &self.prefixes,
-                        self.prev_code,
-                        &mut self.pending[..prev_len],
-                    );
+                    if prev_wr_len > 0 {
+                        // Even for the spill path, use copy_within into
+                        // pending when possible. Copy prev output from `out`
+                        // into pending, then append first byte.
+                        self.pending[..prev_len]
+                            .copy_from_slice(&out[prev_wr_start..prev_wr_start + prev_len]);
+                    } else {
+                        Self::reconstruct_streaming_into(
+                            &self.suffixes,
+                            &self.prefixes,
+                            self.prev_code,
+                            &mut self.pending[..prev_len],
+                        );
+                    }
                     let first = self.pending[0];
                     self.pending[prev_len] = first;
                     self.pending_len = value_len as u16;
                     self.pending_off = 0;
-                    let n = self.drain_pending(out);
-                    out = &mut out[n..];
+                    let n = self.drain_pending(&mut out[wr..]);
+                    wr += n;
+                    prev_wr_len = 0; // went to pending
                     self.derive(first);
                     self.prev_code = code;
                     if self.pending_len > 0 {
@@ -2578,7 +2600,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
 
         BufferResult {
             consumed_in: o_in - inp.len(),
-            consumed_out: o_out - out.len(),
+            consumed_out: wr,
             status,
         }
     }
