@@ -229,7 +229,7 @@ fn bench_workload(g: &mut BenchGroup, w: &Workload) {
 }
 
 fn bench_strategies(suite: &mut Suite) {
-    let size = 256 * 1024;
+    let size = 2 * 1024 * 1024;
     let seed = 0xDEADBEEF;
 
     let workloads = vec![
