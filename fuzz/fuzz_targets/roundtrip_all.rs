@@ -50,8 +50,11 @@ fuzz_target!(|data: &[u8]| {
             .with_table_strategy(strategy)
     };
 
-    // Decode with both strategies
+    // Decode with all three strategies
     let classic = make_config(decode::TableStrategy::Classic)
+        .build()
+        .decode(&encoded);
+    let chunked = make_config(decode::TableStrategy::Chunked)
         .build()
         .decode(&encoded);
     let streaming = make_config(decode::TableStrategy::Streaming)
@@ -59,11 +62,16 @@ fuzz_target!(|data: &[u8]| {
         .decode(&encoded);
 
     let classic = classic.expect("classic decode failed");
+    let chunked = chunked.expect("chunked decode failed");
     let streaming = streaming.expect("streaming decode failed");
 
     assert_eq!(
         clamped, classic,
         "classic roundtrip (size={size} tiff={tiff} yield={yield_on_full})"
+    );
+    assert_eq!(
+        classic, chunked,
+        "classic vs chunked (size={size} tiff={tiff} yield={yield_on_full})"
     );
     assert_eq!(
         classic, streaming,

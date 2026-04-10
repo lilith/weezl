@@ -82,7 +82,7 @@ fn decode_full(
     }
 }
 
-/// Assert Classic and Streaming produce identical output.
+/// Assert Classic, Chunked, and Streaming produce identical output.
 fn assert_parity(
     data: &[u8],
     order: BitOrder,
@@ -105,6 +105,15 @@ fn assert_parity(
         TableStrategy::Classic,
         out_buf_size,
     );
+    let chunked = decode_full(
+        &encoded,
+        order,
+        size,
+        tiff,
+        yield_on_full,
+        TableStrategy::Chunked,
+        out_buf_size,
+    );
     let streaming = decode_full(
         &encoded,
         order,
@@ -115,20 +124,38 @@ fn assert_parity(
         out_buf_size,
     );
 
+    let ctx = format!(
+        "order={:?} size={} tiff={} yield={} buf={} datalen={}",
+        order, size, tiff, yield_on_full, out_buf_size, data.len()
+    );
+
+    // Chunked uses the same burst decoder as Classic, so it must match
+    // Classic byte-for-byte in all cases.
+    match (&classic, &chunked) {
+        (Ok(c), Ok(ch)) => {
+            assert_eq!(c, ch, "Classic vs Chunked differ: {ctx}");
+        }
+        (Err(_), Err(_)) => {}
+        (Ok(c), Err(e)) => {
+            panic!("Classic succeeded ({} bytes) but Chunked failed: {e} ({ctx})", c.len());
+        }
+        (Err(e), Ok(ch)) => {
+            panic!("Classic failed ({e}) but Chunked succeeded ({} bytes) ({ctx})", ch.len());
+        }
+    }
+
     match (classic, streaming) {
         (Ok(c), Ok(s)) => {
             // Streaming must always round-trip correctly.
             assert_eq!(
                 data, &s[..],
-                "Streaming roundtrip mismatch: order={:?} size={} tiff={} yield={} buf={} datalen={}",
-                order, size, tiff, yield_on_full, out_buf_size, data.len()
+                "Streaming roundtrip mismatch: {ctx}"
             );
             if c.len() == s.len() {
                 // Both produced the same length — must be identical.
                 assert_eq!(
                     c, s,
-                    "Classic vs Streaming differ: order={:?} size={} tiff={} yield={} buf={} datalen={}",
-                    order, size, tiff, yield_on_full, out_buf_size, data.len()
+                    "Classic vs Streaming differ: {ctx}"
                 );
             } else {
                 // Classic produced fewer bytes (known limitation with
@@ -137,16 +164,9 @@ fn assert_parity(
                 // Streaming's.
                 assert!(
                     s.starts_with(&c),
-                    "Classic output is not a prefix of Streaming: classic={} streaming={} \
-                     (order={:?} size={} tiff={} yield={} buf={} datalen={})",
+                    "Classic output is not a prefix of Streaming: classic={} streaming={} ({ctx})",
                     c.len(),
                     s.len(),
-                    order,
-                    size,
-                    tiff,
-                    yield_on_full,
-                    out_buf_size,
-                    data.len()
                 );
             }
         }
@@ -155,16 +175,8 @@ fn assert_parity(
         }
         (Ok(c), Err(se)) => {
             panic!(
-                "Classic succeeded ({} bytes) but Streaming failed: {} \
-                 (order={:?} size={} tiff={} yield={} buf={} datalen={})",
+                "Classic succeeded ({} bytes) but Streaming failed: {se} ({ctx})",
                 c.len(),
-                se,
-                order,
-                size,
-                tiff,
-                yield_on_full,
-                out_buf_size,
-                data.len()
             );
         }
         (Err(ce), Ok(s)) => {
@@ -173,16 +185,8 @@ fn assert_parity(
             assert_eq!(
                 data,
                 &s[..],
-                "Classic failed ({}) but Streaming produced wrong output ({} bytes) \
-                 (order={:?} size={} tiff={} yield={} buf={} datalen={})",
-                ce,
+                "Classic failed ({ce}) but Streaming produced wrong output ({} bytes) ({ctx})",
                 s.len(),
-                order,
-                size,
-                tiff,
-                yield_on_full,
-                out_buf_size,
-                data.len()
             );
         }
     }

@@ -210,6 +210,7 @@ fn bench_workload(g: &mut BenchGroup, w: &Workload) {
 
     for &(label, strategy) in &[
         ("classic", TableStrategy::Classic),
+        ("chunked", TableStrategy::Chunked),
         ("streaming", TableStrategy::Streaming),
     ] {
         let enc = Arc::clone(&w.encoded);

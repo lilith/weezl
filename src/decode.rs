@@ -197,6 +197,29 @@ struct Table {
 
 const MASK: usize = MAX_ENTRIES - 1;
 
+/// Suffix chunk width for [`ChunkedTable`]. Each entry stores the last 8
+/// bytes of its decoded string; longer strings chain back via `prefixes`.
+const Q: usize = 8;
+
+/// Alternative decode table that stores 8 bytes of suffix per entry, cutting
+/// chain walks by a factor of 8. Uses the same 6-wide burst decoder as
+/// [`Table`] (Classic) but with a wider table layout.
+///
+/// Memory: 4 arrays × 4096 entries = 52 KB (vs Classic's 24 KB).
+/// All arrays are fixed-size so `idx & MASK` indexing avoids bounds checks.
+struct ChunkedTable {
+    len: usize,
+    /// Up to `Q` trailing bytes of the decoded string for this code.
+    suffixes: Box<[[u8; Q]; MAX_ENTRIES]>,
+    /// Code of the ancestor whose suffix precedes these `Q` bytes; `0` when
+    /// the whole string fits in `suffixes[idx]`.
+    prefixes: Box<[Code; MAX_ENTRIES]>,
+    /// `length - 1` of the decoded string for this code.
+    lm1s: Box<[u16; MAX_ENTRIES]>,
+    /// First byte of the decoded string.
+    firsts: Box<[u8; MAX_ENTRIES]>,
+}
+
 /// Strategy for the LZW decode table.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum TableStrategy {
@@ -204,6 +227,13 @@ pub enum TableStrategy {
     /// (24 KB). This is the default, matching weezl's existing behavior.
     #[default]
     Classic,
+    /// 8-byte suffix chunks (52 KB table) with the same 6-wide burst
+    /// decoder as Classic. Up to ~3× faster on palette / screen-content
+    /// data where LZW produces long strings, at the cost of a 10–20%
+    /// regression on high-entropy (photographic) input. Uses fixed-size
+    /// arrays with masked indexing for zero bounds checks in the
+    /// reconstruct inner loop.
+    Chunked,
     /// Streaming single-code-per-iteration decoder with a PreQ+SufQ(Q=8)
     /// table and a mini-burst fast path for consecutive literals or
     /// short copies (value length ≤ 8). Inspired by the wuffs_lzw
@@ -293,10 +323,13 @@ impl Configuration {
     ///   table with a 6-wide burst decoder. Matches existing weezl
     ///   behavior.
     ///
+    /// - [`TableStrategy::Chunked`]: 8-byte suffix chunks with the same
+    ///   6-wide burst decoder. Faster than Classic on palette / screen
+    ///   content data, slower on high-entropy photographic data.
+    ///
     /// - [`TableStrategy::Streaming`]: single-code-per-iteration decoder
     ///   with a mini-burst literal/short-copy fast path. Beats Classic
-    ///   on real-world TIFF and GIF aggregates by 3–35% across
-    ///   photographic, screenshot, and palette data. Drop-in
+    ///   and Chunked on real-world TIFF and GIF aggregates. Drop-in
     ///   replacement; supports every Configuration option.
     ///
     /// Default: [`TableStrategy::Classic`]. For new code,
@@ -365,6 +398,18 @@ impl Decoder {
             }
             (BitOrder::Msb, true, TableStrategy::Classic) => {
                 make_state!(MsbBuffer, Table, YieldOnFull)
+            }
+            (BitOrder::Lsb, false, TableStrategy::Chunked) => {
+                make_state!(LsbBuffer, ChunkedTable, NoYield)
+            }
+            (BitOrder::Lsb, true, TableStrategy::Chunked) => {
+                make_state!(LsbBuffer, ChunkedTable, YieldOnFull)
+            }
+            (BitOrder::Msb, false, TableStrategy::Chunked) => {
+                make_state!(MsbBuffer, ChunkedTable, NoYield)
+            }
+            (BitOrder::Msb, true, TableStrategy::Chunked) => {
+                make_state!(MsbBuffer, ChunkedTable, YieldOnFull)
             }
             (BitOrder::Lsb, false, TableStrategy::Streaming) => {
                 let mut state = Box::new(DecodeStateStreaming::<StreamingLsb, NoYield>::new(
@@ -1545,10 +1590,6 @@ impl Table {
         }
     }
 
-    fn at(&self, code: Code) -> &Link {
-        &self.inner[usize::from(code) & MASK]
-    }
-
     fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1594,7 +1635,6 @@ trait DecodeTable {
     fn new() -> Self;
     fn init(&mut self, min_size: u8);
     fn clear(&mut self, min_size: u8);
-    fn at(&self, code: Code) -> &Link;
     fn first_of(&self, code: Code) -> u8;
     fn depth(&self, code: Code) -> u16;
     fn len(&self) -> usize;
@@ -1616,10 +1656,6 @@ impl DecodeTable for Table {
 
     fn clear(&mut self, min_size: u8) {
         Table::clear(self, min_size)
-    }
-
-    fn at(&self, code: Code) -> &Link {
-        Table::at(self, code)
     }
 
     fn first_of(&self, code: Code) -> u8 {
@@ -1652,6 +1688,141 @@ impl DecodeTable for Table {
 
     fn reconstruct(&self, code: Code, out: &mut [u8]) -> u8 {
         Table::reconstruct(self, code, out)
+    }
+}
+
+impl DecodeTable for ChunkedTable {
+    fn new() -> Self {
+        ChunkedTable {
+            len: 0,
+            suffixes: boxed_arr(),
+            prefixes: boxed_arr(),
+            lm1s: boxed_arr(),
+            firsts: boxed_arr(),
+        }
+    }
+
+    fn clear(&mut self, min_size: u8) {
+        self.len = usize::from(1u16 << u16::from(min_size)) + 2;
+    }
+
+    fn init(&mut self, min_size: u8) {
+        self.len = 0;
+        for i in 0..(1u16 << u16::from(min_size)) {
+            let byte = i as u8;
+            let idx = self.len & MASK;
+            self.suffixes[idx] = [0u8; Q];
+            self.suffixes[idx][0] = byte;
+            self.prefixes[idx] = 0;
+            self.lm1s[idx] = 0;
+            self.firsts[idx] = byte;
+            self.len += 1;
+        }
+        // Clear code + End code: skip writing when the masked index would
+        // alias an alphabet entry (happens at min_size=12 where clear=4096
+        // wraps to index 0). The len counter still advances so is_full()
+        // correctly reports the table as full.
+        for _ in 0..2 {
+            if self.len < MAX_ENTRIES {
+                let idx = self.len & MASK;
+                self.suffixes[idx] = [0u8; Q];
+                self.prefixes[idx] = 0;
+                self.lm1s[idx] = 0;
+                self.firsts[idx] = 0;
+            }
+            self.len += 1;
+        }
+    }
+
+    fn first_of(&self, code: Code) -> u8 {
+        self.firsts[usize::from(code) & MASK]
+    }
+
+    fn depth(&self, code: Code) -> u16 {
+        self.lm1s[usize::from(code) & MASK] + 1
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len >= MAX_ENTRIES
+    }
+
+    fn derive(&mut self, from: &DerivationBase, byte: u8) {
+        let parent = usize::from(from.code) & MASK;
+        let parent_lm1 = self.lm1s[parent];
+        let new_lm1 = parent_lm1 + 1;
+        // Position in the current 8-byte chunk: 0..Q means same chunk as
+        // parent, Q means we start a fresh chunk and chain back via prefixes.
+        let pos = (parent_lm1 as usize & (Q - 1)) + 1;
+        let idx = self.len & MASK;
+
+        if pos < Q {
+            self.suffixes[idx] = self.suffixes[parent];
+            self.suffixes[idx][pos] = byte;
+            self.prefixes[idx] = self.prefixes[parent];
+        } else {
+            self.suffixes[idx] = [0u8; Q];
+            self.suffixes[idx][0] = byte;
+            self.prefixes[idx] = from.code;
+        }
+        self.lm1s[idx] = new_lm1;
+        self.firsts[idx] = from.first;
+        self.len += 1;
+    }
+
+    fn derive_burst(&mut self, from: &mut DerivationBase, burst: &[Code], first: &[u8]) {
+        for (&code, &first_byte) in burst.iter().zip(first.iter()) {
+            DecodeTable::derive(self, from, first_byte);
+            from.code = code;
+            from.first = first_byte;
+        }
+    }
+
+    fn reconstruct(&self, code: Code, out: &mut [u8]) -> u8 {
+        let ci = usize::from(code) & MASK;
+        let suf = &self.suffixes[ci];
+        let mut c = code;
+        let mut o = out.len();
+
+        // Short strings (≤ Q bytes): suffix contains the complete string,
+        // and suffix[0] IS the first byte. No firsts[] read needed.
+        // Inline the copy for 1-2 bytes to avoid memcpy call overhead.
+        if o <= Q {
+            if o == 1 {
+                out[0] = suf[0];
+            } else if o == 2 {
+                out[0] = suf[0];
+                out[1] = suf[1];
+            } else {
+                out[..o].copy_from_slice(&suf[..o]);
+            }
+            return suf[0];
+        }
+
+        let first = self.firsts[ci];
+
+        // Handle the tail (possibly shorter than Q) then walk full chunks
+        // back-to-front through the prefix chain.
+        let tail_len = ((o - 1) & (Q - 1)) + 1;
+        o -= tail_len;
+        let ci = usize::from(c) & MASK;
+        out[o..o + tail_len].copy_from_slice(&self.suffixes[ci][..tail_len]);
+        c = self.prefixes[ci];
+
+        for chunk in out[..o].chunks_exact_mut(Q).rev() {
+            let ci = usize::from(c) & MASK;
+            chunk.copy_from_slice(&self.suffixes[ci]);
+            c = self.prefixes[ci];
+        }
+
+        first
     }
 }
 

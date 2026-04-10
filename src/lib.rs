@@ -121,28 +121,70 @@ pub use self::error::{BufferResult, LzwError, LzwStatus};
 
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
-    use crate::decode::Decoder;
+    use crate::alloc::vec;
+    use crate::alloc::vec::Vec;
+    use crate::decode::{Configuration as DecodeConfig, Decoder, TableStrategy};
     use crate::encode::Encoder;
+    use crate::BitOrder;
 
     #[cfg(feature = "std")]
     use crate::{decode, encode};
+
+    const ALL_STRATEGIES: [TableStrategy; 3] = [
+        TableStrategy::Classic,
+        TableStrategy::Chunked,
+        TableStrategy::Streaming,
+    ];
 
     /// Regression: at min_code_size=12, clear/end code indices (4096/4097)
     /// must not wrap via `& MASK` and overwrite alphabet entries 0/1.
     #[test]
     fn roundtrip_min_code_size_12() {
-        use crate::BitOrder;
-        for &order in &[BitOrder::Lsb, BitOrder::Msb] {
-            for byte in 0..=255u8 {
-                let encoded = Encoder::new(order, 12).encode(&[byte]).unwrap();
-                let decoded = Decoder::new(order, 12).decode(&encoded).unwrap();
-                assert_eq!(
-                    decoded,
-                    crate::alloc::vec![byte],
-                    "{:?} size=12 byte={}",
-                    order,
-                    byte
-                );
+        let data: Vec<u8> = (0..4096u16).flat_map(|n| n.to_le_bytes()).collect();
+        for &order in &[BitOrder::Msb, BitOrder::Lsb] {
+            let encoded = Encoder::new(order, 12).encode(&data).unwrap();
+            for &strategy in &ALL_STRATEGIES {
+                let decoded = DecodeConfig::new(order, 12)
+                    .with_table_strategy(strategy)
+                    .build()
+                    .decode(&encoded)
+                    .unwrap();
+                assert_eq!(decoded, data, "order={:?} strategy={:?}", order, strategy);
+            }
+        }
+    }
+
+    /// All three table strategies must produce identical output on the same
+    /// encoded data across every legal code size and bit order.
+    #[test]
+    fn roundtrip_all_strategies_all_sizes() {
+        for size in 2u8..=12 {
+            let alphabet_mask: u8 = if size >= 8 {
+                0xFF
+            } else {
+                (1u16 << size).wrapping_sub(1) as u8
+            };
+            let mut data = vec![0u8; 16 * 1024];
+            let mut state: u32 = 0x1234_5678;
+            for b in data.iter_mut() {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (state >> 24) as u8 & alphabet_mask;
+            }
+
+            for &order in &[BitOrder::Msb, BitOrder::Lsb] {
+                let encoded = Encoder::new(order, size).encode(&data).unwrap();
+                for &strategy in &ALL_STRATEGIES {
+                    let decoded = DecodeConfig::new(order, size)
+                        .with_table_strategy(strategy)
+                        .build()
+                        .decode(&encoded)
+                        .unwrap();
+                    assert_eq!(
+                        decoded, data,
+                        "size={} order={:?} strategy={:?}",
+                        size, order, strategy
+                    );
+                }
             }
         }
     }
