@@ -208,8 +208,9 @@ fn bench_workload(g: &mut BenchGroup, w: &Workload) {
     g.throughput(Throughput::Bytes(w.decoded_size as u64));
     // Bump min_sample_ns to 10ms (zenbench default is 5ms): solid-color
     // KwKwK iterations are so short that 5ms gives noisy aggregates;
-    // 10ms gives a tight CV across trials. Run with `--trials=3` for the
-    // most stable mean estimates on flat-ui workloads.
+    // 10ms gives a tight CV across processes. Run with
+    // `--best-of-processes=3` on a busy host or `--mean-of-processes=5`
+    // on a quiet one for the most stable aggregated numbers.
     g.config().min_sample_ns(10_000_000);
     g.config().max_rounds(500);
     g.config().min_rounds(100);
