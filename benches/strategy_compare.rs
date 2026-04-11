@@ -206,12 +206,11 @@ fn make_workload(name: &'static str, data: &[u8], order: BitOrder, tiff: bool) -
 
 fn bench_workload(g: &mut BenchGroup, w: &Workload) {
     g.throughput(Throughput::Bytes(w.decoded_size as u64));
-    // zenbench's default sample_target_ns (1ms) produces ~1–4 iterations
-    // per sample for 256KB–2MB LZW decodes, leaving samples vulnerable to
-    // OS interrupts (per-sample CV 14–27% observed at 256KB). Bump to 10ms
-    // so each sample runs ≥10 iterations and absorbs noise rather than
-    // amplifying it.
-    g.config().sample_target_ns(10_000_000);
+    // Bump min_sample_ns to 10ms (zenbench default is 5ms): solid-color
+    // KwKwK iterations are so short that 5ms gives noisy aggregates;
+    // 10ms gives a tight CV across trials. Run with `--trials=3` for the
+    // most stable mean estimates on flat-ui workloads.
+    g.config().min_sample_ns(10_000_000);
     g.config().max_rounds(500);
     g.config().min_rounds(100);
     let out_cap = w.decoded_size + 4096;

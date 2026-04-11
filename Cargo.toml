@@ -100,3 +100,6 @@ required-features = ["alloc"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+[patch.crates-io]
+zenbench = { path = "../zenbench" }
