@@ -212,6 +212,8 @@ fn bench_workload(g: &mut BenchGroup, w: &Workload) {
     // so each sample runs ≥10 iterations and absorbs noise rather than
     // amplifying it.
     g.config().sample_target_ns(10_000_000);
+    g.config().max_rounds(500);
+    g.config().min_rounds(100);
     let out_cap = w.decoded_size + 4096;
 
     for &(label, strategy) in &[
