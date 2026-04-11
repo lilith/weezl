@@ -2208,6 +2208,7 @@ impl<P: StreamingBitPacking, CgC: CodegenConstants> DecodeStateStreaming<P, CgC>
     /// verified empirically to compile to a 7-instruction loop body per
     /// Q-chunk with a single qword load and a single qword store, no
     /// per-iter bounds check, and no memcpy call.
+    ///
     #[inline(always)]
     fn reconstruct_streaming_into(
         suffixes: &[[u8; STREAMING_Q]; MAX_ENTRIES],
@@ -2505,18 +2506,14 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 let value_len = usize::from(self.lm1s[usize::from(code) & STREAMING_MASK]) + 1;
 
                 if value_len <= out.len() {
-                    // Direct reconstruct into caller's slice.
+                    // Direct reconstruct into caller's slice. The COPY
+                    // path does NOT touch last_decoded — leaving a stale
+                    // reference is harmless because the KwKwK fast path
+                    // checks length before using it.
                     let (target, tail) = out.split_at_mut(value_len);
                     self.reconstruct_streaming(code, target);
                     let first = target[0];
                     out = tail;
-                    // Only long values need the `last_decoded` reference;
-                    // short values (≤ Q) are reachable via the table suffix.
-                    if value_len > STREAMING_Q {
-                        last_decoded = Some(&*target);
-                    } else {
-                        last_decoded = None;
-                    }
                     if self.prev_code != self.end_code {
                         self.derive(first);
                     }
@@ -2562,20 +2559,23 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 if value_len <= out.len() {
                     let (target, tail) = out.split_at_mut(value_len);
                     // Three-way dispatch on how to obtain prev_code's value:
-                    //   1. prev_len ≤ Q: the full value is in the table's
-                    //      suffix chunk — read it directly, no chain walk.
-                    //   2. prev_len > Q and `last_decoded` is valid: memcpy
-                    //      from the previous output. This is the critical
-                    //      solid-color path where every KwKwK has a long
-                    //      chain and a table walk would be O(chain/Q).
-                    //   3. prev_len > Q and `last_decoded` is None: fall
-                    //      back to the chain walk. Only hits across
-                    //      advance() boundaries, which is rare.
+                    //   1. prev_len ≤ Q: read directly from the table suffix.
+                    //   2. last_decoded matches prev_len: memcpy from
+                    //      previous output. (Length filter handles stale
+                    //      references left by long COPYs.)
+                    //   3. otherwise: chain walk via reconstruct_streaming_into.
                     if prev_len <= STREAMING_Q {
                         let suf = &self.suffixes[prev_ci];
                         target[..prev_len].copy_from_slice(&suf[..prev_len]);
-                    } else if let Some(source) = last_decoded.take() {
-                        debug_assert_eq!(source.len(), prev_len);
+                    } else if let Some(source) = last_decoded
+                        .take()
+                        .filter(|s| s.len() == prev_len)
+                    {
+                        // Length filter: defends against stale references
+                        // (e.g., a long KwKwK followed by a short COPY/KwKwK
+                        // followed by another long KwKwK whose prev is the
+                        // short code — by then last_decoded points at the
+                        // earlier long value with a different length).
                         target[..prev_len].copy_from_slice(source);
                     } else {
                         Self::reconstruct_streaming_into(
@@ -2588,8 +2588,6 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                     let first = target[0];
                     target[prev_len] = first;
                     out = tail;
-                    // Only track long values; short ones stay reachable
-                    // via the table suffix.
                     if value_len > STREAMING_Q {
                         last_decoded = Some(&*target);
                     } else {
