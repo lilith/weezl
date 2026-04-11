@@ -1903,6 +1903,19 @@ impl DerivationBase {
 const STREAMING_Q: usize = 8;
 const STREAMING_MASK: usize = MAX_ENTRIES - 1;
 
+/// Empty function marked `#[cold]` so calling it serves as a code-layout
+/// hint to LLVM: any block that calls `streaming_cold_marker()` is
+/// considered cold and gets pushed to the end of the parent function.
+/// The call itself is optimized away (the body is empty), so there is
+/// no runtime cost in either direction.
+///
+/// Used to keep the KwKwK and CLEAR/END branches from inflating the
+/// hot LITERAL/COPY paths in `advance()`. A stable substitute for the
+/// nightly `core::hint::cold_path()`.
+#[cold]
+#[inline(never)]
+fn streaming_cold_marker() {}
+
 // ----- Bit packing direction (zero-cost compile-time generic) -----
 
 /// Marker trait for LSB vs MSB bit ordering. Implemented by zero-sized
@@ -2364,6 +2377,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 if inp.len() >= 8 {
                     P::refill_fast8(&mut self.bit_buffer, &mut self.n_bits, &mut inp);
                 } else if !inp.is_empty() {
+                    streaming_cold_marker();
                     // Slow path: byte-at-a-time until we have enough bits
                     // or the input is empty.
                     while self.n_bits < self.width && !inp.is_empty() {
@@ -2379,6 +2393,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                         break;
                     }
                 } else {
+                    streaming_cold_marker();
                     status = if o_in > inp.len() {
                         Ok(LzwStatus::Ok)
                     } else {
@@ -2400,6 +2415,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
             if code < self.clear_code {
                 // ==== LITERAL path ====
                 if out.is_empty() {
+                    streaming_cold_marker();
                     // Put the bits back — we can't commit this code yet.
                     P::put_back(&mut self.bit_buffer, &mut self.n_bits, self.width, code);
                     break;
@@ -2488,12 +2504,14 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 }
             } else if code == self.clear_code {
                 // ==== CLEAR ====
+                streaming_cold_marker();
                 self.init_table();
                 self.bump_if_lowbit();
                 // prev_code is back to the sentinel.
                 last_decoded = None;
             } else if code == self.end_code {
                 // ==== END ====
+                streaming_cold_marker();
                 self.has_ended = true;
                 status = Ok(LzwStatus::Done);
                 break;
@@ -2519,11 +2537,10 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                     }
                     self.prev_code = code;
                 } else {
+                    streaming_cold_marker();
                     // value_len > out.len(): spill through pending so we
                     // can partially fill out this call and drain the rest
-                    // on the next advance(). yield_on_full mode ALSO
-                    // spills — the yield behavior is in the top-of-loop
-                    // check which breaks as soon as out is fully drained.
+                    // on the next advance().
                     let first = self.first_of(code);
                     Self::reconstruct_streaming_into(
                         &self.suffixes,
@@ -2547,6 +2564,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 }
             } else if code == self.save_code {
                 // ==== KwKwK (code equals the key being added) ====
+                streaming_cold_marker();
                 if self.prev_code == self.end_code {
                     status = Err(LzwError::InvalidCode);
                     break;
@@ -2596,6 +2614,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                     self.derive(first);
                     self.prev_code = code;
                 } else {
+                    streaming_cold_marker();
                     // Spill path: reconstruct into pending, read first from
                     // pending[0] (cheap because we just wrote it).
                     Self::reconstruct_streaming_into(
@@ -2619,6 +2638,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                 }
             } else {
                 // Invalid code.
+                streaming_cold_marker();
                 status = Err(LzwError::InvalidCode);
                 break;
             }
