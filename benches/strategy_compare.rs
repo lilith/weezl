@@ -206,6 +206,12 @@ fn make_workload(name: &'static str, data: &[u8], order: BitOrder, tiff: bool) -
 
 fn bench_workload(g: &mut BenchGroup, w: &Workload) {
     g.throughput(Throughput::Bytes(w.decoded_size as u64));
+    // zenbench's default sample_target_ns (1ms) produces ~1–4 iterations
+    // per sample for 256KB–2MB LZW decodes, leaving samples vulnerable to
+    // OS interrupts (per-sample CV 14–27% observed at 256KB). Bump to 10ms
+    // so each sample runs ≥10 iterations and absorbs noise rather than
+    // amplifying it.
+    g.config().sample_target_ns(10_000_000);
     let out_cap = w.decoded_size + 4096;
 
     for &(label, strategy) in &[
@@ -229,7 +235,7 @@ fn bench_workload(g: &mut BenchGroup, w: &Workload) {
 }
 
 fn bench_strategies(suite: &mut Suite) {
-    let size = 2 * 1024 * 1024;
+    let size = 256 * 1024;
     let seed = 0xDEADBEEF;
 
     let workloads = vec![
