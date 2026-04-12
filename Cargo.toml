@@ -24,7 +24,7 @@ features = ["std"]
 
 [dev-dependencies]
 criterion = "0.3.1"
-zenbench = "0.1.3"
+zenbench = "0.1.6"
 [dev-dependencies.tokio]
 version = "1"
 default-features = false
