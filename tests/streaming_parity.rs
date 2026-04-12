@@ -102,7 +102,7 @@ fn assert_parity(
         size,
         tiff,
         yield_on_full,
-        TableStrategy::Classic,
+        TableStrategy::ByteLink,
         out_buf_size,
     );
     let chunked = decode_full(
@@ -111,7 +111,7 @@ fn assert_parity(
         size,
         tiff,
         yield_on_full,
-        TableStrategy::Chunked,
+        TableStrategy::ByteLink, // was Chunked, now maps to same impl
         out_buf_size,
     );
     let streaming = decode_full(

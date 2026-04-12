@@ -223,44 +223,30 @@ struct ChunkedTable {
 /// Strategy for the LZW decode table.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum TableStrategy {
-    /// Classic 6-wide burst decoder with compact 4-byte-per-entry table
-    /// (24 KB). This is the default, matching weezl's existing behavior.
+    /// Burst decoder with link-chain table. Decodes up to 6 codes per
+    /// iteration via a burst buffer, reconstructing each code's output
+    /// by walking the predecessor chain of `Link` entries. This is
+    /// weezl's original decode strategy.
+    ///
+    /// Table size: ~24 KB (4 bytes per entry × 4096 entries + depths).
     #[default]
-    Classic,
-    /// 8-byte suffix chunks (52 KB table) with the same 6-wide burst
-    /// decoder as Classic. Up to ~3× faster on palette / screen-content
-    /// data where LZW produces long strings, at the cost of a 10–20%
-    /// regression on high-entropy (photographic) input. Uses fixed-size
-    /// arrays with masked indexing for zero bounds checks in the
-    /// reconstruct inner loop.
-    Chunked,
+    ByteLink,
     /// Streaming single-code-per-iteration decoder with a PreQ+SufQ(Q=8)
     /// table and a mini-burst fast path for consecutive literals or
-    /// short copies (value length ≤ 8). Inspired by the wuffs_lzw
-    /// reference decoder's loop structure.
+    /// short copies (value length ≤ 8).
     ///
     /// Supports all Configuration options: LSB and MSB bit order, TIFF
     /// early-change, and `yield_on_full_buffer` — i.e., it is a drop-in
-    /// replacement for the Classic strategy in every configuration.
-    ///
-    /// Recommended for all workloads. Beats Classic on every tested
-    /// workload except solid single-byte data (pure KwKwK):
-    ///
-    ///   * Palette / GIF / screenshot data: 2–3× faster than Classic,
-    ///     75–85% of wuffs_lzw throughput.
-    ///   * Random / incompressible data: ~2× faster than Classic,
-    ///     ~82% of wuffs_lzw throughput.
-    ///   * Solid single-byte data: ~78% slower than Classic (Classic's
-    ///     burst decoder does a single memcpy per max-length code).
+    /// replacement for the ByteLink strategy in every configuration.
     ///
     /// Table size: ~52 KB (PreQ+SufQ layout with Q=8).
-    ///
-    /// Per-decoder allocation cost is higher than Classic (~3× on Linux
-    /// glibc) but the `reset()` path is fast (~160 ns), so callers that
-    /// reuse a single decoder across many strips or frames pay the
-    /// allocation cost only once. This matters most on Windows where
-    /// `HeapAlloc` is ~5× slower than glibc malloc.
     Streaming,
+    /// Deprecated alias for [`ByteLink`](TableStrategy::ByteLink).
+    #[doc(hidden)]
+    Classic,
+    /// Deprecated alias for [`ByteLink`](TableStrategy::ByteLink).
+    #[doc(hidden)]
+    Chunked,
 }
 
 /// Describes the static parameters for creating a decoder.
@@ -282,7 +268,7 @@ impl Configuration {
             size,
             tiff: false,
             yield_on_full: false,
-            strategy: TableStrategy::Classic,
+            strategy: TableStrategy::ByteLink,
         }
     }
 
@@ -294,7 +280,7 @@ impl Configuration {
             size,
             tiff: true,
             yield_on_full: false,
-            strategy: TableStrategy::Classic,
+            strategy: TableStrategy::ByteLink,
         }
     }
 
@@ -319,21 +305,16 @@ impl Configuration {
 
     /// Select the decode table strategy.
     ///
-    /// - [`TableStrategy::Classic`] (default): compact 4-byte-per-entry
-    ///   table with a 6-wide burst decoder. Matches existing weezl
-    ///   behavior.
-    ///
-    /// - [`TableStrategy::Chunked`]: 8-byte suffix chunks with the same
-    ///   6-wide burst decoder. Faster than Classic on palette / screen
-    ///   content data, slower on high-entropy photographic data.
+    /// - [`TableStrategy::ByteLink`] (default): burst decoder with
+    ///   link-chain table. Reconstructs codes by walking predecessor
+    ///   links.
     ///
     /// - [`TableStrategy::Streaming`]: single-code-per-iteration decoder
-    ///   with a mini-burst literal/short-copy fast path. Beats Classic
-    ///   and Chunked on real-world TIFF and GIF aggregates. Drop-in
-    ///   replacement; supports every Configuration option.
+    ///   with suffix-chunk table and a mini-burst literal/short-copy
+    ///   fast path. Drop-in replacement; supports every Configuration
+    ///   option.
     ///
-    /// Default: [`TableStrategy::Classic`]. For new code,
-    /// [`TableStrategy::Streaming`] is the recommended choice.
+    /// Default: [`TableStrategy::ByteLink`].
     pub fn with_table_strategy(self, strategy: TableStrategy) -> Self {
         Configuration { strategy, ..self }
     }
@@ -387,29 +368,33 @@ impl Decoder {
             configuration.yield_on_full,
             configuration.strategy,
         ) {
-            (BitOrder::Lsb, false, TableStrategy::Classic) => {
+            (
+                BitOrder::Lsb,
+                false,
+                TableStrategy::ByteLink | TableStrategy::Classic | TableStrategy::Chunked,
+            ) => {
                 make_state!(LsbBuffer, Table, NoYield)
             }
-            (BitOrder::Lsb, true, TableStrategy::Classic) => {
+            (
+                BitOrder::Lsb,
+                true,
+                TableStrategy::ByteLink | TableStrategy::Classic | TableStrategy::Chunked,
+            ) => {
                 make_state!(LsbBuffer, Table, YieldOnFull)
             }
-            (BitOrder::Msb, false, TableStrategy::Classic) => {
+            (
+                BitOrder::Msb,
+                false,
+                TableStrategy::ByteLink | TableStrategy::Classic | TableStrategy::Chunked,
+            ) => {
                 make_state!(MsbBuffer, Table, NoYield)
             }
-            (BitOrder::Msb, true, TableStrategy::Classic) => {
+            (
+                BitOrder::Msb,
+                true,
+                TableStrategy::ByteLink | TableStrategy::Classic | TableStrategy::Chunked,
+            ) => {
                 make_state!(MsbBuffer, Table, YieldOnFull)
-            }
-            (BitOrder::Lsb, false, TableStrategy::Chunked) => {
-                make_state!(LsbBuffer, ChunkedTable, NoYield)
-            }
-            (BitOrder::Lsb, true, TableStrategy::Chunked) => {
-                make_state!(LsbBuffer, ChunkedTable, YieldOnFull)
-            }
-            (BitOrder::Msb, false, TableStrategy::Chunked) => {
-                make_state!(MsbBuffer, ChunkedTable, NoYield)
-            }
-            (BitOrder::Msb, true, TableStrategy::Chunked) => {
-                make_state!(MsbBuffer, ChunkedTable, YieldOnFull)
             }
             (BitOrder::Lsb, false, TableStrategy::Streaming) => {
                 let mut state = Box::new(DecodeStateStreaming::<StreamingLsb, NoYield>::new(

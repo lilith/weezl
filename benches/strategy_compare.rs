@@ -68,7 +68,7 @@ fn make_workload(name: &'static str, data: &[u8], order: BitOrder, tiff: bool) -
         Encoder::new(order, 8).encode(data).unwrap()
     };
     let mut scratch = vec![0u8; data.len() + 4096];
-    let decoded_size = decode_all(&encoded, &mut scratch, order, tiff, TableStrategy::Classic);
+    let decoded_size = decode_all(&encoded, &mut scratch, order, tiff, TableStrategy::ByteLink);
     Workload {
         name,
         encoded: Arc::new(encoded),
@@ -86,8 +86,7 @@ fn bench_workload(g: &mut BenchGroup, w: &Workload) {
     let out_cap = w.decoded_size + 4096;
 
     for &(label, strategy) in &[
-        ("classic", TableStrategy::Classic),
-        ("chunked", TableStrategy::Chunked),
+        ("bytelink", TableStrategy::ByteLink),
         ("streaming", TableStrategy::Streaming),
     ] {
         let enc = Arc::clone(&w.encoded);

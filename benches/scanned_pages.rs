@@ -262,8 +262,7 @@ fn bench_page(g: &mut BenchGroup, page: &Page) {
     let out_cap = page.total_decoded + 4096;
 
     for &(label, strategy) in &[
-        ("classic", TableStrategy::Classic),
-        ("chunked", TableStrategy::Chunked),
+        ("bytelink", TableStrategy::ByteLink),
         ("streaming", TableStrategy::Streaming),
     ] {
         // Shallow clone of all strips so each bench closure owns them.

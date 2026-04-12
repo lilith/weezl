@@ -1,15 +1,30 @@
 //! Synthetic LZW workload generators fitted to real-world data.
 //!
-//! Three generator models cover the full range of LZW workloads:
+//! Earlier versions of these generators used simple byte-stat fitting
+//! (entropy, run-length, compression ratio) which matched the marginal
+//! distributions of real scans but missed the LZW code-stream structure
+//! entirely — width_12 was off by 99%, literal_frac by 50%. The decoder
+//! cost model depends on code-level features (literal vs copy fractions,
+//! bit-width distribution, KwKwK rate), so byte-stat-only fit gave
+//! misleading perf comparisons between strategies. See
+//! `docs/code-level-fit-analysis.md` for the full post-mortem.
+//!
+//! The current generators use three structural models that reproduce
+//! both byte-level AND code-level features of real LZW streams:
 //!
 //! 1. **Document generator** (`GenParams` + `generate`): Markov chain
 //!    BG/FG/noise model with pattern library and row-repeat template
 //!    tiling. Produces scanned-document-like byte streams fitted to
-//!    RVL-CDIP and Brown v. Board real corpus data.
+//!    RVL-CDIP and Brown v. Board real corpus data. Pattern library
+//!    simulates recurring character glyphs; row-repeat simulates
+//!    scanline-aligned text structure. Code-level fit within 5% on
+//!    literal/short_copy/long_copy/width_12 for scanned documents.
 //!
 //! 2. **Photo generator** (`PhotoParams` + `generate_photo`): Random walk
 //!    with flat-hold regions and film grain noise. Produces continuous-tone
-//!    byte streams fitted to NASA Apollo film scans and CLIC 2025 photos.
+//!    byte streams fitted to NASA Apollo film scans, Cleveland Museum of
+//!    Art CC0 paintings, and CLIC 2025 validation images. Code-level fit
+//!    within 5% for grayscale photos, within 2% for color.
 //!
 //! 3. **Flat-UI generator** (`generate_flat_ui`): Palette-indexed block
 //!    structure simulating GIF screenshots and flat-design graphics.
