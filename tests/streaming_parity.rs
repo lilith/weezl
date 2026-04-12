@@ -126,7 +126,12 @@ fn assert_parity(
 
     let ctx = format!(
         "order={:?} size={} tiff={} yield={} buf={} datalen={}",
-        order, size, tiff, yield_on_full, out_buf_size, data.len()
+        order,
+        size,
+        tiff,
+        yield_on_full,
+        out_buf_size,
+        data.len()
     );
 
     // Chunked uses the same burst decoder as Classic, so it must match
@@ -137,26 +142,26 @@ fn assert_parity(
         }
         (Err(_), Err(_)) => {}
         (Ok(c), Err(e)) => {
-            panic!("Classic succeeded ({} bytes) but Chunked failed: {e} ({ctx})", c.len());
+            panic!(
+                "Classic succeeded ({} bytes) but Chunked failed: {e} ({ctx})",
+                c.len()
+            );
         }
         (Err(e), Ok(ch)) => {
-            panic!("Classic failed ({e}) but Chunked succeeded ({} bytes) ({ctx})", ch.len());
+            panic!(
+                "Classic failed ({e}) but Chunked succeeded ({} bytes) ({ctx})",
+                ch.len()
+            );
         }
     }
 
     match (classic, streaming) {
         (Ok(c), Ok(s)) => {
             // Streaming must always round-trip correctly.
-            assert_eq!(
-                data, &s[..],
-                "Streaming roundtrip mismatch: {ctx}"
-            );
+            assert_eq!(data, &s[..], "Streaming roundtrip mismatch: {ctx}");
             if c.len() == s.len() {
                 // Both produced the same length — must be identical.
-                assert_eq!(
-                    c, s,
-                    "Classic vs Streaming differ: {ctx}"
-                );
+                assert_eq!(c, s, "Classic vs Streaming differ: {ctx}");
             } else {
                 // Classic produced fewer bytes (known limitation with
                 // yield_on_full + tiny output buffers). Verify Streaming

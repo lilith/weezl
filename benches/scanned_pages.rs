@@ -48,11 +48,7 @@ struct Page {
     total_decoded: usize,
 }
 
-fn decode_all(
-    encoded: &[u8],
-    out: &mut [u8],
-    strategy: TableStrategy,
-) -> usize {
+fn decode_all(encoded: &[u8], out: &mut [u8], strategy: TableStrategy) -> usize {
     // TIFF-LZW: MSB bit order, min_code_size 8, early-change size switch.
     let mut dec = Configuration::with_tiff_size_switch(BitOrder::Msb, 8)
         .with_table_strategy(strategy)
@@ -212,13 +208,16 @@ fn extract_strips(bytes: &[u8]) -> Option<Page> {
     }
 
     // bytes per row = width * samples * bits/8 (grayscale 8-bit = width)
-    let bytes_per_row = (image_width as usize)
-        * (samples_per_pixel as usize)
-        * ((bits_per_sample as usize) / 8);
+    let bytes_per_row =
+        (image_width as usize) * (samples_per_pixel as usize) * ((bits_per_sample as usize) / 8);
 
     let mut strips: Vec<Strip> = Vec::with_capacity(strip_offsets.len());
     let mut total_decoded = 0usize;
-    for (idx, (&off, &len)) in strip_offsets.iter().zip(strip_byte_counts.iter()).enumerate() {
+    for (idx, (&off, &len)) in strip_offsets
+        .iter()
+        .zip(strip_byte_counts.iter())
+        .enumerate()
+    {
         let off = off as usize;
         let len = len as usize;
         if off + len > bytes.len() {
@@ -304,7 +303,8 @@ fn bench_scanned_pages(suite: &mut Suite) {
                     name,
                     p.strips.len(),
                     p.total_decoded,
-                    p.total_decoded as f64 / p.strips.iter().map(|s| s.encoded.len()).sum::<usize>() as f64
+                    p.total_decoded as f64
+                        / p.strips.iter().map(|s| s.encoded.len()).sum::<usize>() as f64
                 );
                 pages.push(p);
             }

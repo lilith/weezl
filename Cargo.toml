@@ -66,6 +66,11 @@ name = "strategy_compare"
 harness = false
 required-features = ["alloc"]
 
+[[bench]]
+name = "scanned_pages"
+harness = false
+required-features = ["std"]
+
 [[example]]
 name = "lzw-compress"
 required-features = ["std"]

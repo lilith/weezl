@@ -211,9 +211,7 @@ pub fn generate_photo(params: &PhotoParams, len: usize, seed: u32) -> Vec<u8> {
     let delta = params.walk_delta as i16;
     let delta_span = (2 * delta + 1).max(1) as u32;
     let channels = params.channels.max(1) as usize;
-    let flat_val_span = (params.flat_val_hi as u32)
-        .saturating_sub(params.flat_val_lo as u32)
-        + 1;
+    let flat_val_span = (params.flat_val_hi as u32).saturating_sub(params.flat_val_lo as u32) + 1;
     let flat_noise = params.flat_noise as i16;
     let noise_span = (2 * flat_noise + 1).max(1) as u32;
 
@@ -248,8 +246,7 @@ pub fn generate_photo(params: &PhotoParams, len: usize, seed: u32) -> Vec<u8> {
                 out.push(val[ch] as u8);
                 if (rng.next() as f64 / u) < params.flat_p {
                     flat[ch] = true;
-                    flat_hold[ch] =
-                        (params.flat_val_lo as u32 + rng.next() % flat_val_span) as i16;
+                    flat_hold[ch] = (params.flat_val_lo as u32 + rng.next() % flat_val_span) as i16;
                 }
             }
         }

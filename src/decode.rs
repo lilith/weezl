@@ -2585,9 +2585,7 @@ impl<P: StreamingBitPacking + 'static, CgC: CodegenConstants + 'static> Stateful
                     if prev_len <= STREAMING_Q {
                         let suf = &self.suffixes[prev_ci];
                         target[..prev_len].copy_from_slice(&suf[..prev_len]);
-                    } else if let Some(source) = last_decoded
-                        .take()
-                        .filter(|s| s.len() == prev_len)
+                    } else if let Some(source) = last_decoded.take().filter(|s| s.len() == prev_len)
                     {
                         // Length filter: defends against stale references
                         // (e.g., a long KwKwK followed by a short COPY/KwKwK
