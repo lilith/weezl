@@ -64,24 +64,44 @@ class Rng:
 
 
 def gen_markov(params, length, seed):
-    """Two-state Markov generator.
+    """Three-state Markov generator (BG, FG, BG_NOISE).
+
+    Mirrors the Rust `generate` in `benches/strategy_compare.rs`
+    byte-for-byte: same xorshift32 stream, same branch order. Any
+    change here must be made there too, and vice versa.
 
     Params:
-      p_bg_to_fg   prob of entering FG each BG pixel
-      p_fg_to_bg   prob of returning to BG each FG pixel
-      bg_noise_p   prob that a BG pixel is a uniform-random byte in [0, 254]
-      fg_lo, fg_hi FG stretch picks a base byte uniformly from [fg_lo, fg_hi]
-      fg_jitter    each FG pixel emits base + uniform([-jitter, jitter])
+      p_bg_to_fg      prob of entering FG from clean BG, per pixel
+      p_fg_to_bg      prob of returning to BG from FG, per pixel
+      bg_burst_p      prob of starting a noise burst from clean BG,
+                      per pixel. Replaces the old `bg_noise_p`; on
+                      backward-compat targets we set bg_burst_end_p=1.0
+                      so the generator reproduces i.i.d. Bernoulli noise.
+      bg_burst_end_p  prob of ending a noise burst, per BG_NOISE pixel.
+                      With bg_burst_end_p=1.0 every burst is length one
+                      (Bernoulli). With bg_burst_end_p=0.1 the burst
+                      length is geometrically distributed with mean 10.
+      fg_lo, fg_hi    FG stretch picks a base byte uniformly from
+                      [fg_lo, fg_hi]
+      fg_jitter       each FG pixel emits base + uniform([-jitter, jitter])
     """
     p_bf = params["p_bg_to_fg"]
     p_fb = params["p_fg_to_bg"]
-    bg_noise_p = params["bg_noise_p"]
+    # Backward compat: allow callers to pass the old `bg_noise_p` key
+    # with an implicit bg_burst_end_p=1.0 (one-pixel bursts = Bernoulli).
+    if "bg_burst_p" in params:
+        bg_burst_p = params["bg_burst_p"]
+        bg_burst_end_p = params.get("bg_burst_end_p", 1.0)
+    else:
+        bg_burst_p = params.get("bg_noise_p", 0.0)
+        bg_burst_end_p = 1.0
     fg_lo = params["fg_lo"]
     fg_hi = params["fg_hi"]
     fg_jitter = params["fg_jitter"]
 
     rng = Rng(seed)
     out = bytearray(length)
+    # 0 = BG, 1 = FG, 2 = BG_NOISE (geometric-length burst of noisy bytes).
     state = 0
     fg_base = 0
     U = float(0xFFFFFFFF)
@@ -89,14 +109,19 @@ def gen_markov(params, length, seed):
     jitter_span = 2 * fg_jitter + 1
     for i in range(length):
         if state == 0:
-            if (rng.next() / U) < bg_noise_p:
-                out[i] = rng.next() % 255  # 0..254, uniform; never 255
-            else:
-                out[i] = 255
+            # Clean BG. Emit 255, optionally start FG or BG_NOISE.
+            # Branch order MUST match Rust: FG check first, burst
+            # second. The probabilities are small enough that ordering
+            # rarely matters for metrics, but byte equivalence
+            # depends on it.
+            out[i] = 255
             if (rng.next() / U) < p_bf:
                 state = 1
                 fg_base = fg_lo + (rng.next() % span_fg)
-        else:
+            elif (rng.next() / U) < bg_burst_p:
+                state = 2
+        elif state == 1:
+            # FG: ink tone with jitter around stretch base.
             delta = (rng.next() % jitter_span) - fg_jitter
             v = fg_base + delta
             if v < 0:
@@ -105,6 +130,11 @@ def gen_markov(params, length, seed):
                 v = 255
             out[i] = v
             if (rng.next() / U) < p_fb:
+                state = 0
+        else:
+            # BG_NOISE: geometric-length run of uniform 0..=254 bytes.
+            out[i] = rng.next() % 255  # 0..254, uniform; never 255
+            if (rng.next() / U) < bg_burst_end_p:
                 state = 0
     return bytes(out)
 
@@ -248,19 +278,30 @@ TARGETS = {
 
 # Hand-tuned starting points from iterative grid search. The refinement loop
 # below trims them further but these are already within ±15% on all metrics.
+#
+# `bg_burst_end_p = 1.0` = Bernoulli-equivalent (each noisy pixel is its own
+# length-1 burst). Lower values produce spatially-clustered noise bursts
+# whose length is geometrically distributed with mean 1/bg_burst_end_p.
+# Used by the blank archetype to push entropy up without breaking runs.
 STARTING_POINTS = {
     "email": {
         "p_bg_to_fg": 0.0070,
         "p_fg_to_bg": 0.25,
-        "bg_noise_p": 0.0,
+        "bg_burst_p": 0.0004,
+        "bg_burst_end_p": 1.0,
         "fg_lo": 0,
         "fg_hi": 150,
         "fg_jitter": 5,
     },
     "blank": {
+        # Start from a bursty baseline. Rough analytic estimate: to reach
+        # entropy 0.123 from mode_frac 0.992 we need ~0.8% non-255 bytes,
+        # and mean-10 bursts deliver them at ~1.1 breaks/byte instead of
+        # Bernoulli's 2 breaks/byte — enough headroom to hit rl_mean 113.
         "p_bg_to_fg": 0.0017,
         "p_fg_to_bg": 0.25,
-        "bg_noise_p": 0.0010,
+        "bg_burst_p": 0.0001,
+        "bg_burst_end_p": 0.10,
         "fg_lo": 0,
         "fg_hi": 120,
         "fg_jitter": 10,
@@ -268,7 +309,8 @@ STARTING_POINTS = {
     "dense": {
         "p_bg_to_fg": 0.025,
         "p_fg_to_bg": 0.25,
-        "bg_noise_p": 0.0,
+        "bg_burst_p": 0.0,
+        "bg_burst_end_p": 1.0,
         "fg_lo": 0,
         "fg_hi": 150,
         "fg_jitter": 10,
@@ -313,7 +355,7 @@ def refine(name, length, width, height, seed):
             return True
         return False
 
-    for _ in range(3):
+    for _ in range(5):
         improved = False
         for scale in (0.85, 0.93, 1.08, 1.17):
             p = dict(best_params)
@@ -323,10 +365,21 @@ def refine(name, length, width, height, seed):
             p = dict(best_params)
             p["p_fg_to_bg"] = min(1.0, max(0.05, best_params["p_fg_to_bg"] * scale))
             improved |= trial(p)
-        for d in (-0.0005, -0.0002, 0.0002, 0.0005):
+        # Noise-burst start rate — how often a burst kicks off.
+        for scale in (0.5, 0.75, 1.25, 2.0):
             p = dict(best_params)
-            p["bg_noise_p"] = max(0.0, best_params["bg_noise_p"] + d)
+            p["bg_burst_p"] = max(0.0, best_params["bg_burst_p"] * scale)
             improved |= trial(p)
+        # Burst-end probability — controls mean burst length.
+        # Only meaningful when bg_burst_p > 0 AND bg_burst_end_p < 1.0
+        # (otherwise there are no multi-pixel bursts to tune).
+        if best_params.get("bg_burst_end_p", 1.0) < 1.0 and best_params.get("bg_burst_p", 0.0) > 0.0:
+            for scale in (0.5, 0.75, 1.33, 2.0):
+                p = dict(best_params)
+                p["bg_burst_end_p"] = min(
+                    1.0, max(0.01, best_params["bg_burst_end_p"] * scale)
+                )
+                improved |= trial(p)
         for d in (-2, -1, 1, 2):
             p = dict(best_params)
             p["fg_jitter"] = max(0, best_params["fg_jitter"] + d)
@@ -372,8 +425,8 @@ def main():
             print(f"# {n:12s} {key:15s} {t:10.3f} {v:10.3f} {e*100:9.1f}%")
         print(
             f"# {n}: p_bg_to_fg={p['p_bg_to_fg']:.6f} p_fg_to_bg={p['p_fg_to_bg']:.3f} "
-            f"bg_noise_p={p['bg_noise_p']:.6f} fg_lo={p['fg_lo']} fg_hi={p['fg_hi']} "
-            f"fg_jitter={p['fg_jitter']}"
+            f"bg_burst_p={p['bg_burst_p']:.6f} bg_burst_end_p={p['bg_burst_end_p']:.3f} "
+            f"fg_lo={p['fg_lo']} fg_hi={p['fg_hi']} fg_jitter={p['fg_jitter']}"
         )
 
 

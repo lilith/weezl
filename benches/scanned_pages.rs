@@ -12,9 +12,9 @@
 //! 8-bit grayscale page with LZW compression and horizontal differencing.
 //!
 //! Run with (busy host, want the floor):
-//!     cargo bench --bench scanned_pages -- --best-of-processes=3
+//!     cargo bench --bench scanned_pages -- --best-of-passes=3
 //! or (quiet host, want expected performance):
-//!     cargo bench --bench scanned_pages -- --mean-of-processes=5
+//!     cargo bench --bench scanned_pages -- --mean-of-passes=5
 //!
 //! The IFD walker is a minimal little-endian TIFF parser: it finds
 //! StripOffsets (0x0111), StripByteCounts (0x0117), and StripsPerImage,
