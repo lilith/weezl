@@ -187,30 +187,11 @@ def lzw_ratio(raw_bytes, width, height):
     img = Image.frombytes("L", (width, height), raw_bytes)
     buf = io.BytesIO()
     img.save(buf, format="TIFF", compression="tiff_lzw")
-    blob = buf.getvalue()
-    if len(blob) < 8 or blob[:2] != b"II":
+    parsed = _extract_strip_bytes_tiff(buf.getvalue())
+    if parsed is None:
         return float("inf")
-    ifd_off = struct.unpack_from("<I", blob, 4)[0]
-    n_entries = struct.unpack_from("<H", blob, ifd_off)[0]
-    strip_byte_counts = []
-    for i in range(n_entries):
-        e = ifd_off + 2 + i * 12
-        tag, type_, count = struct.unpack_from("<HHI", blob, e)
-        value = blob[e + 8 : e + 12]
-        if tag == 0x117:
-            elem = {3: 2, 4: 4}.get(type_)
-            total = elem * count
-            sl = value if total <= 4 else blob[
-                struct.unpack_from("<I", value, 0)[0] :
-                struct.unpack_from("<I", value, 0)[0] + total
-            ]
-            for j in range(count):
-                if elem == 2:
-                    v = struct.unpack_from("<H", sl, j * 2)[0]
-                else:
-                    v = struct.unpack_from("<I", sl, j * 4)[0]
-                strip_byte_counts.append(v)
-    enc = sum(strip_byte_counts)
+    strips, _decoded_len = parsed
+    enc = sum(len(s) for s in strips)
     return len(raw_bytes) / enc if enc else float("inf")
 
 
@@ -236,6 +217,258 @@ def measure_named(raw, width, height):
         "mode_frac": hist.most_common(1)[0][1] / len(raw) if raw else 0.0,
         "lzw_ratio": lzw_ratio(raw, width, height),
     }
+
+
+# ---------------------------------------------------------------------------
+# Code-level feature extractor — for fitting-to-performance, not bytes.
+# ---------------------------------------------------------------------------
+#
+# Byte-level statistics (entropy, rl_mean, lzw_ratio) are properties of the
+# DATA. Decoder performance is a function of the CODE STREAM — how many
+# codes, how long each decoded value is, how often KwKwK happens, how
+# deep the prefix chains go. Two TIFFs with identical byte entropy can
+# decode at very different speeds if their LZW code-length distributions
+# differ, so fitting to byte features doesn't guarantee a fitted
+# archetype will reproduce the real corpus's performance curve.
+#
+# This extractor runs a minimal MSB TIFF-LZW decoder with TIFF early-
+# change size switch, collects per-code feature histograms, and returns
+# the feature vector. No timing involved; just counts. The output feeds
+# into a linear cost model ("cycles ≈ α + β × codes + γ × long_copy_bytes
+# + ...") that can be fit against real weezl benchmark data in a
+# separate step, giving us a cheap proxy for decode throughput.
+
+
+def _extract_strip_bytes_tiff(blob):
+    """Parse a TIFF blob (possibly multi-strip) and return
+    ``(strips, decoded_len)`` where ``strips`` is a list of raw LZW
+    byte strings — one per TIFF strip — and ``decoded_len`` is the
+    total number of decoded bytes in the image.
+
+    Assumes the TIFF was emitted by Pillow with compression='tiff_lzw'.
+    Walks the IFD to find StripOffsets + StripByteCounts + ImageWidth +
+    ImageLength + BitsPerSample + SamplesPerPixel. Each LZW strip is
+    an independent stream with its own clear code at the start.
+    """
+    if len(blob) < 8 or blob[:2] != b"II":
+        return None
+    ifd_off = struct.unpack_from("<I", blob, 4)[0]
+    n_entries = struct.unpack_from("<H", blob, ifd_off)[0]
+    img_w = img_h = bps = spp = 0
+    strip_offsets = []
+    strip_byte_counts = []
+
+    def read_array(type_, count, value_bytes):
+        """Return a list of `count` ints from an IFD value field.
+        For total <= 4 bytes they're inline; otherwise the value is an
+        offset to the array."""
+        elem = {3: 2, 4: 4}.get(type_)
+        if elem is None:
+            return []
+        total = elem * count
+        if total <= 4:
+            sl = value_bytes
+        else:
+            off = struct.unpack_from("<I", value_bytes, 0)[0]
+            sl = blob[off : off + total]
+        out = []
+        for j in range(count):
+            if elem == 2:
+                out.append(struct.unpack_from("<H", sl, j * 2)[0])
+            else:
+                out.append(struct.unpack_from("<I", sl, j * 4)[0])
+        return out
+
+    for i in range(n_entries):
+        e = ifd_off + 2 + i * 12
+        tag, type_, count = struct.unpack_from("<HHI", blob, e)
+        value = blob[e + 8 : e + 12]
+
+        if tag == 0x100:  # ImageWidth
+            img_w = read_array(type_, 1, value)[0]
+        elif tag == 0x101:  # ImageLength
+            img_h = read_array(type_, 1, value)[0]
+        elif tag == 0x102:  # BitsPerSample
+            bps = read_array(type_, 1, value)[0] if count == 1 else 8
+        elif tag == 0x115:  # SamplesPerPixel
+            spp = read_array(type_, 1, value)[0]
+        elif tag == 0x111:  # StripOffsets
+            strip_offsets = read_array(type_, count, value)
+        elif tag == 0x117:  # StripByteCounts
+            strip_byte_counts = read_array(type_, count, value)
+
+    if not strip_offsets or len(strip_offsets) != len(strip_byte_counts):
+        return None
+    spp = spp or 1
+    bps = bps or 8
+    decoded_len = img_w * img_h * spp * (bps // 8)
+    strips = [
+        blob[off : off + n]
+        for off, n in zip(strip_offsets, strip_byte_counts)
+    ]
+    return strips, decoded_len
+
+
+class _LzwProfiler:
+    """Minimal MSB TIFF-LZW decoder that collects code-level features.
+
+    Doesn't produce decoded output beyond what's needed to advance the
+    decode table — we just track string lengths and derived metadata.
+    TIFF early-change semantics (width bumps one code sooner than
+    standard LZW) match what weezl's tiff_size_switch mode does.
+    """
+
+    CLEAR_CODE = 256
+    END_CODE = 257
+
+    def __init__(self):
+        self.codes = 0
+        self.literal = 0
+        self.short_copy = 0  # value_len <= 8
+        self.long_copy = 0  # value_len > 8
+        self.kwkwk = 0
+        self.clears = 0
+        self.value_len_hist = Counter()
+        self.width_hist = Counter()  # codes emitted at each width
+        self.max_chain_len = 0  # deepest derived-code chain encountered
+
+    def feed(self, encoded):
+        """Decode `encoded` as TIFF-LZW MSB. Collect features; discard bytes."""
+        # lm1s[code] = length - 1 of the string represented by `code`
+        lm1s = [0] * 4096
+        for i in range(256):
+            lm1s[i] = 0  # each literal has length 1
+
+        # Bit reader: MSB-first, accumulate from left.
+        bit_buf = 0
+        n_bits = 0
+        width = 9  # start at 9 bits for min_code_size=8
+        save_code = 258  # next code to assign
+        # TIFF early-change: bump width when save_code reaches (1 << width) - 1
+        # (one code sooner than standard LZW's (1 << width)).
+        prev_code = -1  # -1 = sentinel "no prev code"
+        inp_pos = 0
+        inp_len = len(encoded)
+
+        def refill_to(target):
+            nonlocal bit_buf, n_bits, inp_pos
+            while n_bits < target and inp_pos < inp_len:
+                bit_buf = (bit_buf << 8) | encoded[inp_pos]
+                inp_pos += 1
+                n_bits += 8
+
+        while True:
+            refill_to(width)
+            if n_bits < width:
+                break
+            # Extract MSB-first: the top `width` bits of bit_buf.
+            shift = n_bits - width
+            code = (bit_buf >> shift) & ((1 << width) - 1)
+            bit_buf &= (1 << shift) - 1
+            n_bits -= width
+            self.codes += 1
+            self.width_hist[width] += 1
+
+            if code == self.CLEAR_CODE:
+                self.clears += 1
+                save_code = 258
+                width = 9
+                prev_code = -1
+                continue
+            if code == self.END_CODE:
+                break
+
+            if code < self.CLEAR_CODE:
+                # Literal.
+                self.literal += 1
+                self.value_len_hist[1] += 1
+                value_len = 1
+            elif code == save_code:
+                # KwKwK: string is prev's value + prev's first byte.
+                self.kwkwk += 1
+                prev_len = lm1s[prev_code] + 1 if prev_code >= 0 else 0
+                value_len = prev_len + 1
+                self.value_len_hist[value_len] += 1
+                if value_len > 8:
+                    self.long_copy += 1
+                else:
+                    self.short_copy += 1
+            elif code < save_code:
+                # Regular copy — look up length.
+                value_len = lm1s[code] + 1
+                self.value_len_hist[value_len] += 1
+                if value_len > 8:
+                    self.long_copy += 1
+                else:
+                    self.short_copy += 1
+            else:
+                # Invalid (ahead of save_code + 1). Stop; count as end.
+                break
+
+            # Derive a new entry based on prev_code.
+            if prev_code >= 0 and save_code < 4096:
+                new_len = lm1s[prev_code] + 2  # +1 for link, +1 for base count
+                # Actually: new entry's length = prev's length + 1 (one byte appended).
+                new_len = (lm1s[prev_code] + 1) + 1
+                lm1s[save_code] = new_len - 1
+                if new_len > self.max_chain_len:
+                    self.max_chain_len = new_len
+                save_code += 1
+                # TIFF early-change width bump: trigger when save_code
+                # reaches (1 << width) - 1, one code sooner than standard.
+                if save_code >= (1 << width) - 1 and width < 12:
+                    width += 1
+
+            prev_code = code
+
+    def report(self, decoded_bytes):
+        vl = self.value_len_hist
+        total_vl_bytes = sum(k * v for k, v in vl.items())
+        mean_vl = total_vl_bytes / max(sum(vl.values()), 1)
+        long_copy_bytes = sum(k * v for k, v in vl.items() if k > 8)
+        return {
+            "total_codes": self.codes,
+            "codes_per_decoded_byte": self.codes / max(decoded_bytes, 1),
+            "literal_frac": self.literal / max(self.codes, 1),
+            "short_copy_frac": self.short_copy / max(self.codes, 1),
+            "long_copy_frac": self.long_copy / max(self.codes, 1),
+            "kwkwk_frac": self.kwkwk / max(self.codes, 1),
+            "clears": self.clears,
+            "mean_value_len": mean_vl,
+            "long_copy_byte_frac": long_copy_bytes / max(decoded_bytes, 1),
+            "max_chain_len": self.max_chain_len,
+            "width_9": self.width_hist.get(9, 0) / max(self.codes, 1),
+            "width_10": self.width_hist.get(10, 0) / max(self.codes, 1),
+            "width_11": self.width_hist.get(11, 0) / max(self.codes, 1),
+            "width_12": self.width_hist.get(12, 0) / max(self.codes, 1),
+        }
+
+
+def profile_lzw(raw_bytes, width, height):
+    """Encode raw bytes as TIFF-LZW via Pillow, then decode with our
+    profiler to extract code-level features.
+
+    Returns a dict of feature → value. The features are independent of
+    any particular decoder strategy — they describe the LZW code stream
+    itself, which is what drives decoder performance.
+    """
+    img = Image.frombytes("L", (width, height), raw_bytes)
+    buf = io.BytesIO()
+    img.save(buf, format="TIFF", compression="tiff_lzw")
+    return _profile_tiff_blob(buf.getvalue())
+
+
+def _profile_tiff_blob(blob):
+    """Profile a TIFF-LZW blob. Each strip is a separate LZW stream,
+    so we run the profiler on each and aggregate counts."""
+    parsed = _extract_strip_bytes_tiff(blob)
+    if parsed is None:
+        return None
+    strips, decoded_len = parsed
+    prof = _LzwProfiler()
+    for strip in strips:
+        prof.feed(strip)
+    return prof.report(decoded_len)
 
 
 # ---------------------------------------------------------------------------
