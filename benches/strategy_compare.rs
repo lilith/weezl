@@ -110,6 +110,34 @@ struct GenParams {
     /// FG pixels within a stretch are `fg_base + uniform(-jitter, +jitter)`,
     /// clamped to 0..=255. Controls how much LZW can compress ink runs.
     fg_jitter: u8,
+    /// Number of fixed byte patterns in the "glyph library." Each
+    /// pattern is a deterministic byte sequence (generated from the
+    /// PRNG seed at init) that simulates a character glyph — the same
+    /// pixel block that repeats every time that "letter" appears on
+    /// a page. Patterns give the LZW dictionary repeating entries to
+    /// match, driving down `literal_frac` and up `short_copy_frac`
+    /// to match real scanned documents. 0 = disabled (backward compat).
+    n_patterns: u32,
+    /// Length of each pattern in bytes (e.g. 6 ≈ one glyph's pixel
+    /// footprint at low res). Only meaningful when `n_patterns > 0`.
+    pattern_len: u32,
+    /// When entering FG, probability of emitting a pattern instead of
+    /// random jitter bytes. 0.0 = always jitter (backward compat).
+    pattern_frac: f64,
+    /// Row width for scanline-repeat mode. When > 0, generates
+    /// `n_template_rows` template rows with the Markov model, then
+    /// tiles them with per-pixel ink noise. Simulates real scanned
+    /// text where each row of pixels through a text line shares the
+    /// same column structure. 0 = flat stream (backward compat).
+    row_width: u32,
+    /// Number of distinct template rows. Adjacent rows use different
+    /// templates (simulating different text lines), cycling every N
+    /// rows. More templates = more inter-row diversity (higher literal)
+    /// but less periodic repetition (lower width_12).
+    n_template_rows: u32,
+    /// Per-pixel noise on ink (non-255) pixels during row tiling.
+    /// Creates row-to-row variation that fills the LZW dictionary.
+    row_noise: u8,
 }
 
 /// xorshift32 PRNG — deterministic, no deps. Must match tools/fit_generator.py.
@@ -127,6 +155,37 @@ impl Rng {
 }
 
 fn generate(params: &GenParams, len: usize, seed: u32) -> Vec<u8> {
+    // Row-repeat mode: generate N template rows, tile with ink noise.
+    if params.row_width > 0 {
+        let rw = params.row_width as usize;
+        let n_tpl = (params.n_template_rows as usize).max(1);
+        let inner = GenParams {
+            row_width: 0,
+            n_template_rows: 0,
+            row_noise: 0,
+            ..*params
+        };
+        let templates: Vec<Vec<u8>> = (0..n_tpl)
+            .map(|t| generate(&inner, rw, seed.wrapping_add(t as u32)))
+            .collect();
+        let noise = params.row_noise as i16;
+        let noise_span = (2 * noise + 1).max(1) as u32;
+        let mut rng = Rng::new(seed);
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let row = i / rw;
+            let v = templates[row % n_tpl][i % rw];
+            let v = if noise > 0 && v != 255 {
+                let delta = (rng.next() % noise_span) as i16 - noise;
+                (v as i16 + delta).clamp(0, 255) as u8
+            } else {
+                v
+            };
+            out.push(v);
+        }
+        return out;
+    }
+
     let mut rng = Rng::new(seed);
     let u = u32::MAX as f64;
     let fg_lo = params.fg_lo as i16;
@@ -135,25 +194,52 @@ fn generate(params: &GenParams, len: usize, seed: u32) -> Vec<u8> {
     let jitter = params.fg_jitter as i16;
     let jitter_span = (2 * jitter + 1).max(1) as u32;
 
+    // Build pattern library from the PRNG stream. Each pattern is a
+    // fixed byte sequence that simulates a character glyph — the same
+    // pixel block repeated every time that "letter" appears. Only
+    // consumes PRNG values when n_patterns > 0, keeping the stream
+    // identical for backward-compatible parameter sets.
+    let patterns: Vec<Vec<u8>> = if params.n_patterns > 0 && params.pattern_frac > 0.0 {
+        (0..params.n_patterns)
+            .map(|_| {
+                let base = fg_lo + (rng.next() % fg_span) as i16;
+                (0..params.pattern_len)
+                    .map(|_| {
+                        let delta = (rng.next() % jitter_span) as i16 - jitter;
+                        (base + delta).clamp(0, 255) as u8
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut out = Vec::with_capacity(len);
     // 0 = BG (clean white), 1 = FG (ink stretch), 2 = BG_NOISE (sensor
-    // noise burst — sits inside BG logically, only transitions to BG).
+    // noise burst — sits inside BG logically, only transitions to BG),
+    // 3 = PATTERN (emitting a glyph from the pattern library).
     let mut state = 0u8;
     let mut fg_base: i16 = 0;
+    let mut pat_idx: usize = 0;
+    let mut pat_pos: u32 = 0;
 
     while out.len() < len {
         match state {
             0 => {
-                // Clean BG: emit 255, optionally start an FG stretch or
-                // a noise burst. FG takes priority over noise (if both
-                // would trigger, we start the FG stretch) — the
-                // probabilities are small enough that ordering rarely
-                // matters, but the deterministic branch order has to
-                // match tools/fit_generator.py byte-for-byte.
+                // Clean BG: emit 255, optionally start an FG stretch,
+                // a pattern glyph, or a noise burst.
                 out.push(255);
                 if (rng.next() as f64 / u) < params.p_bg_to_fg {
-                    state = 1;
-                    fg_base = fg_lo + (rng.next() % fg_span) as i16;
+                    if !patterns.is_empty() && (rng.next() as f64 / u) < params.pattern_frac {
+                        // Emit a pattern "glyph."
+                        state = 3;
+                        pat_idx = (rng.next() % params.n_patterns) as usize;
+                        pat_pos = 0;
+                    } else {
+                        state = 1;
+                        fg_base = fg_lo + (rng.next() % fg_span) as i16;
+                    }
                 } else if (rng.next() as f64 / u) < params.bg_burst_p {
                     state = 2;
                 }
@@ -167,7 +253,7 @@ fn generate(params: &GenParams, len: usize, seed: u32) -> Vec<u8> {
                     state = 0;
                 }
             }
-            _ => {
+            2 => {
                 // BG_NOISE: emit a uniform-random byte in 0..=254 (never
                 // 255, so the noise byte can't pretend to be white). The
                 // burst ends with probability `bg_burst_end_p` per
@@ -175,6 +261,99 @@ fn generate(params: &GenParams, len: usize, seed: u32) -> Vec<u8> {
                 out.push((rng.next() % 255) as u8);
                 if (rng.next() as f64 / u) < params.bg_burst_end_p {
                     state = 0;
+                }
+            }
+            _ => {
+                // PATTERN: emit next byte of the chosen pattern glyph.
+                out.push(patterns[pat_idx][pat_pos as usize]);
+                pat_pos += 1;
+                if pat_pos >= params.pattern_len {
+                    state = 0;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Continuous-tone photo generator — random walk model.
+//
+// Real film scans (Apollo Hasselblad, consumer photography) produce
+// smooth gradients where neighboring pixels differ by only a few values.
+// This drives LZW to build short dictionary entries (value_len ≈ 2-8)
+// that recur frequently, giving high short_copy_frac (65-85%) and low
+// literal_frac (14-52%). The walk model directly produces this
+// correlation by emitting each pixel as prev ± small delta.
+// ---------------------------------------------------------------------------
+
+struct PhotoParams {
+    /// Max step per pixel: each pixel = prev + uniform(-delta, +delta).
+    walk_delta: u8,
+    /// Probability of jumping to a random value (edge/region boundary).
+    edge_p: f64,
+    /// Number of channels (1 = grayscale, 3 = RGB interleaved).
+    channels: u8,
+    /// Probability per WALK pixel of entering FLAT mode.
+    flat_p: f64,
+    /// Probability per FLAT pixel of returning to WALK mode.
+    flat_end_p: f64,
+    /// FLAT mode holds a center value drawn from [flat_val_lo, flat_val_hi].
+    flat_val_lo: u8,
+    flat_val_hi: u8,
+    /// Per-pixel noise in FLAT mode: emit center ± uniform(-noise, +noise).
+    /// Simulates film grain on dark backgrounds. Breaks KwKwK runs and
+    /// reduces compression-ratio overshoot from pure-constant flat regions.
+    flat_noise: u8,
+}
+
+fn generate_photo(params: &PhotoParams, len: usize, seed: u32) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let u = u32::MAX as f64;
+    let delta = params.walk_delta as i16;
+    let delta_span = (2 * delta + 1).max(1) as u32;
+    let channels = params.channels.max(1) as usize;
+    let flat_val_span = (params.flat_val_hi as u32)
+        .saturating_sub(params.flat_val_lo as u32)
+        + 1;
+    let flat_noise = params.flat_noise as i16;
+    let noise_span = (2 * flat_noise + 1).max(1) as u32;
+
+    let mut out = Vec::with_capacity(len);
+    let mut val = [128i16; 3];
+    let mut flat = [false; 3];
+    let mut flat_hold = [0i16; 3]; // center value during flat mode
+
+    while out.len() < len {
+        for ch in 0..channels {
+            if out.len() >= len {
+                break;
+            }
+            if flat[ch] {
+                // FLAT: emit center ± noise, maybe exit.
+                let v = if flat_noise > 0 {
+                    let n = (rng.next() % noise_span) as i16 - flat_noise;
+                    (flat_hold[ch] + n).clamp(0, 255)
+                } else {
+                    flat_hold[ch]
+                };
+                out.push(v as u8);
+                if (rng.next() as f64 / u) < params.flat_end_p {
+                    flat[ch] = false;
+                    val[ch] = flat_hold[ch]; // resume walk from center
+                }
+            } else {
+                // WALK: edge jump, step, maybe enter flat.
+                if (rng.next() as f64 / u) < params.edge_p {
+                    val[ch] = (rng.next() % 256) as i16;
+                }
+                let step = (rng.next() % delta_span) as i16 - delta;
+                val[ch] = (val[ch] + step).clamp(0, 255);
+                out.push(val[ch] as u8);
+                if (rng.next() as f64 / u) < params.flat_p {
+                    flat[ch] = true;
+                    flat_hold[ch] =
+                        (params.flat_val_lo as u32 + rng.next() % flat_val_span) as i16;
                 }
             }
         }
@@ -227,18 +406,32 @@ fn generate(params: &GenParams, len: usize, seed: u32) -> Vec<u8> {
 /// Models typical text document with ~3% ink coverage and short dark
 /// antialiased glyphs on a clean white background.
 ///
-/// `bg_burst_end_p = 1.0` — noise is i.i.d. (each noisy BG pixel is
-/// its own length-1 burst). Email's entropy target is comfortably
-/// reached without spatial clustering because the FG ink contributes
-/// the dominant non-255 byte share; burst model would be overkill.
+/// Uses row-repeat mode: 4 template rows (different text lines) tiled
+/// with ±12 ink noise. The scanline-aligned repetition fills the LZW
+/// table efficiently — width_12 goes from 0.4% (random placement) to
+/// 35% (matching real email within 1.4%). The 4 distinct templates
+/// prevent inter-row long-copy dominance while maintaining enough
+/// periodicity for table saturation.
+///
+/// Code-level fit (vs RVL-CDIP email n=50):
+///   width_12:    0.354 → 0.349  (1.4%)    was 0.004 (99% off)
+///   literal:     0.601 → 0.486  (19%)     was 0.522 (13% off)
+///   entropy:     0.394 → 0.478  (21%)     tradeoff for width_12 fix
+///   lzw_ratio:   22.1  → 17.3   (22%)     tradeoff for width_12 fix
 const SCANNED_EMAIL: GenParams = GenParams {
-    p_bg_to_fg: 0.006510,
+    p_bg_to_fg: 0.007000,
     p_fg_to_bg: 0.25,
-    bg_burst_p: 0.000781,
+    bg_burst_p: 0.000500,
     bg_burst_end_p: 1.0,
     fg_lo: 0,
     fg_hi: 150,
     fg_jitter: 5,
+    n_patterns: 40,
+    pattern_len: 4,
+    pattern_frac: 0.3,
+    row_width: 512,
+    n_template_rows: 4,
+    row_noise: 12,
 };
 
 /// "Blank form" — median of the 15 form files with lzw_ratio ∈ [50, 80].
@@ -266,6 +459,12 @@ const SCANNED_BLANK: GenParams = GenParams {
     fg_lo: 0,
     fg_hi: 120,
     fg_jitter: 10,
+    n_patterns: 0,
+    pattern_len: 0,
+    pattern_frac: 0.0,
+    row_width: 0,
+    n_template_rows: 0,
+    row_noise: 0,
 };
 
 /// "Dense" document — e.g. email_003 (heavy text, low ratio).
@@ -287,6 +486,129 @@ const SCANNED_DENSE: GenParams = GenParams {
     fg_lo: 0,
     fg_hi: 150,
     fg_jitter: 5,
+    n_patterns: 0,
+    pattern_len: 0,
+    pattern_frac: 0.0,
+    row_width: 0,
+    n_template_rows: 0,
+    row_noise: 0,
+};
+
+/// Old monochrome document scan — e.g. typewritten court opinions, typed
+/// briefs, mimeographed forms. Fitted against real TIFF-LZW strips from
+/// Brown v. Board of Education (SCOTUS opinion + NAACP appendix, 79
+/// pages, Georgetown Law Library / IA scans, Public Domain).
+///
+/// These scans have higher entropy than typical office documents
+/// (H≈2.1 vs ≈0.4) due to scanner noise in gray margins and ink bleed
+/// on aged paper. The LZW table saturates fast (width_12 ≈ 46%) with
+/// moderate copy fractions (long_copy ≈ 20%). KwKwK is negligible
+/// (≈1.7%), making chunked's 8-byte suffix lookup the dominant
+/// optimization — streaming's KwKwK fast path barely fires.
+///
+/// The pattern library (40 patterns of 6 bytes each, injected 50% of
+/// the time) simulates recurring glyph pixel blocks that real text
+/// produces — every copy of the letter "e" is the same 6-pixel
+/// footprint. This drives `literal_frac` from 54% down to 35%
+/// (matching real data within 1%) and `lzw_ratio` from 3.5:1 to
+/// 4.9:1 (matching real 5.0:1 within 2%).
+///
+/// Byte-level fit (medians over 79 real pages):
+///   entropy:    2.113 → 2.201  (4.1%)
+///   repeat:     0.784 → 0.784  (0.0%)
+///   rl_mean:    4.62  → 4.62   (0.1%)
+///   lzw_ratio:  4.98  → 4.91   (1.3%)
+///
+/// Code-level fit:
+///   literal:    0.348 → 0.351  (0.9%)
+///   short_copy: 0.443 → 0.441  (0.4%)
+///   long_copy:  0.206 → 0.208  (1.0%)
+///   width_12:   0.463 → 0.440  (4.9%)
+const SCANNED_MONOCHROME_OLD: GenParams = GenParams {
+    p_bg_to_fg: 0.050000,
+    p_fg_to_bg: 0.25,
+    bg_burst_p: 0.0,
+    bg_burst_end_p: 0.2,
+    fg_lo: 0,
+    fg_hi: 200,
+    fg_jitter: 3,
+    n_patterns: 40,
+    pattern_len: 6,
+    pattern_frac: 0.5,
+    row_width: 0,
+    n_template_rows: 0,
+    row_noise: 0,
+};
+
+// ---------------------------------------------------------------------------
+// Fitted photo archetypes — NASA Apollo Hasselblad film scans.
+//
+// Targets are medians over 3 Apollo mission photographs (AS11-40-5937
+// Tranquility Base, as08-14-2383 Earthrise, as17-148-22742 Full Earth),
+// profiled as 8-bit grayscale TIFF-LZW. All NASA public domain.
+//
+// The photo generator uses a random walk with flat-hold regions:
+// WALK mode produces smooth gradients (neighboring pixels ± small delta),
+// FLAT mode holds a near-constant value with film grain noise (center ± N).
+// The alternation between textured and flat regions reproduces the
+// short_copy-dominated LZW code profile of real continuous-tone photos.
+// ---------------------------------------------------------------------------
+
+/// Continuous-tone grayscale photo — e.g. Apollo "Full Earth" film scan.
+/// Target: H≈3.0, ratio≈2.4, literal≈0.15, short_copy≈0.85, w12≈0.52.
+/// Models a continuous-tone grayscale photograph with smooth gradients
+/// and some flat dark regions (shadows, space). Represents the typical
+/// photographic TIFF-LZW workload where nearly all codes are short
+/// dictionary copies (value_len 2-8) and KwKwK is negligible.
+///
+/// Code-level fit (vs as17-148-22742 grayscale):
+///   entropy:     3.01 → 3.09  (2.7%)
+///   lzw_ratio:   2.44 → 2.32  (4.9%)
+///   literal:     0.150 → 0.142 (5.3%)
+///   short_copy:  0.850 → 0.857 (0.8%)
+///   width_12:    0.523 → 0.507 (3.1%)
+///   kwkwk:       0.002 → 0.002 (0%)
+const PHOTO_GRAY: PhotoParams = PhotoParams {
+    walk_delta: 6,
+    edge_p: 0.02,
+    channels: 1,
+    flat_p: 0.05,
+    flat_end_p: 0.005,
+    flat_val_lo: 0,
+    flat_val_hi: 3,
+    flat_noise: 3,
+};
+
+/// Vivid color photo/painting — e.g. a museum-quality art scan or
+/// color landscape photograph. Fitted against Cleveland Museum of Art
+/// CC0 painting scan ("July" by Otto Bacher, 3155×5000 RGB TIFF).
+///
+/// This is LZW's worst case: continuous-tone color with near-maximum
+/// entropy (H≈7.2) produces ratio ≈ 0.91 — LZW *expands* the data.
+/// 73% of codes are literals (the dictionary almost never helps), and
+/// the remaining 27% are short copies. This is what happens when
+/// someone saves a photograph as TIFF-LZW instead of JPEG.
+///
+/// The walk uses delta=1 (minimal per-pixel step — tight local
+/// correlation like real brushstrokes) with edge_p=0.03 and sparse
+/// flat regions (0-50 center, noise ±6) that simulate uniform-tone
+/// areas (sky, background) in paintings.
+///
+/// Code-level fit (vs CMA "July" RGB):
+///   entropy:     7.17 → 7.21  (0.6%)
+///   lzw_ratio:   0.91 → 0.91  (0%)
+///   literal:     0.729 → 0.726 (0.4%)
+///   short_copy:  0.270 → 0.274 (1.5%)
+///   width_12:    0.522 → 0.521 (0.2%)
+const PHOTO_COLOR: PhotoParams = PhotoParams {
+    walk_delta: 1,
+    edge_p: 0.03,
+    channels: 3,
+    flat_p: 0.03,
+    flat_end_p: 0.10,
+    flat_val_lo: 0,
+    flat_val_hi: 50,
+    flat_noise: 6,
 };
 
 // ---------------------------------------------------------------------------
@@ -380,7 +702,27 @@ fn bench_strategies(suite: &mut Suite) {
             BitOrder::Msb,
             true,
         ),
+        make_workload(
+            "scanned-mono-old",
+            &generate(&SCANNED_MONOCHROME_OLD, size, seed),
+            BitOrder::Msb,
+            true,
+        ),
         make_workload("solid-kwkwk", &vec![42u8; size], BitOrder::Msb, true),
+        // Photo workloads — continuous-tone imagery, high short_copy,
+        // negligible KwKwK. Grayscale and RGB to cover both TIFF modes.
+        make_workload(
+            "photo-gray",
+            &generate_photo(&PHOTO_GRAY, size, seed),
+            BitOrder::Msb,
+            true,
+        ),
+        make_workload(
+            "photo-color",
+            &generate_photo(&PHOTO_COLOR, size, seed),
+            BitOrder::Msb,
+            true,
+        ),
         // LSB — GIF configuration. Only the email archetype, since GIF
         // consumers hit the same byte-255-dominated distribution when
         // decoding scanned-document GIFs exported from TIFF pipelines.

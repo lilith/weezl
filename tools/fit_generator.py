@@ -64,7 +64,7 @@ class Rng:
 
 
 def gen_markov(params, length, seed):
-    """Three-state Markov generator (BG, FG, BG_NOISE).
+    """Four-state Markov generator (BG, FG, BG_NOISE, PATTERN).
 
     Mirrors the Rust `generate` in `benches/strategy_compare.rs`
     byte-for-byte: same xorshift32 stream, same branch order. Any
@@ -84,6 +84,20 @@ def gen_markov(params, length, seed):
       fg_lo, fg_hi    FG stretch picks a base byte uniformly from
                       [fg_lo, fg_hi]
       fg_jitter       each FG pixel emits base + uniform([-jitter, jitter])
+      n_patterns      number of fixed byte patterns in the glyph library
+                      (default 0 = disabled, backward compat)
+      pattern_len     length of each pattern in bytes (default 16)
+      pattern_frac    when entering FG, probability of emitting a pattern
+                      instead of jitter bytes (default 0.0)
+      row_width       if > 0, pattern selection is position-dependent:
+                      pattern_idx = f(column) instead of rng(). The same
+                      column gets the same pattern on every row, simulating
+                      the periodic structure of text lines where each copy
+                      of "e" occupies the same column range. This makes
+                      the LZW encoder see repeated prefix→pattern
+                      transitions at the same stream offsets, filling
+                      the dictionary much faster than random placement.
+                      0 = random placement (backward compat).
     """
     p_bf = params["p_bg_to_fg"]
     p_fb = params["p_fg_to_bg"]
@@ -98,26 +112,101 @@ def gen_markov(params, length, seed):
     fg_lo = params["fg_lo"]
     fg_hi = params["fg_hi"]
     fg_jitter = params["fg_jitter"]
+    n_patterns = params.get("n_patterns", 0)
+    pattern_len = params.get("pattern_len", 16)
+    pattern_frac = params.get("pattern_frac", 0.0)
+    row_width = params.get("row_width", 0)
 
     rng = Rng(seed)
+
+    # Generate pattern library from the PRNG stream. Each pattern is a
+    # fixed byte sequence that simulates a character glyph — the same
+    # block of pixels that repeats every time that "letter" appears.
+    # Only consumes PRNG values when n_patterns > 0, so the stream is
+    # unchanged for backward-compatible parameter sets.
+    patterns = []
+    if n_patterns > 0 and pattern_frac > 0.0:
+        span_fg = max(1, fg_hi - fg_lo + 1)
+        for _ in range(n_patterns):
+            base = fg_lo + (rng.next() % span_fg)
+            pat = bytearray(pattern_len)
+            for j in range(pattern_len):
+                jspan = 2 * fg_jitter + 1
+                delta = (rng.next() % jspan) - fg_jitter
+                v = base + delta
+                if v < 0:
+                    v = 0
+                elif v > 255:
+                    v = 255
+                pat[j] = v
+            patterns.append(bytes(pat))
+
+    # Row-repeat mode: generate one template row with the Markov model,
+    # then tile it for every row with per-pixel noise. This creates the
+    # scanline-aligned periodic structure that real text has — every row
+    # through a text line has ink at the same columns, which makes the
+    # LZW encoder see repeated prefix→pattern transitions at the same
+    # stream offsets, filling the dictionary far faster than random FG
+    # placement. row_noise controls the per-pixel jitter on the
+    # template (0 = exact repeat → massive KwKwK; 1-3 = realistic
+    # noise → fast table fill without KwKwK inflation).
+    row_noise = params.get("row_noise", 0)
+    white_noise = params.get("white_noise", 0)
+
+    n_template_rows = max(1, params.get("n_template_rows", 1))
+
+    if row_width > 0:
+        # Generate template rows using the standard Markov model.
+        # Multiple templates simulate different text lines — adjacent
+        # rows have different content (breaking inter-row long copies
+        # and increasing literal_frac) while every Nth row repeats
+        # (maintaining periodic structure for LZW table fill).
+        inner_params = dict(params, row_width=0)
+        templates = []
+        for t in range(n_template_rows):
+            # Each template uses a different seed offset for variety
+            tmpl = bytearray(gen_markov(inner_params, row_width, seed + t))
+            templates.append(tmpl)
+        noise_span = 2 * row_noise + 1
+        wnoise_span = 2 * white_noise + 1
+        out = bytearray(length)
+        for i in range(length):
+            row = i // row_width
+            template = templates[row % n_template_rows]
+            v = template[i % row_width]
+            if row_noise > 0 and v != 255:
+                # Ink noise: ±row_noise on dark pixels.
+                delta = (rng.next() % noise_span) - row_noise
+                v = max(0, min(255, v + delta))
+            elif white_noise > 0 and v == 255:
+                # Sensor noise on white pixels.
+                delta = (rng.next() % wnoise_span) - white_noise
+                v = max(0, min(255, 255 + delta))
+            out[i] = v
+        return bytes(out)
+
     out = bytearray(length)
-    # 0 = BG, 1 = FG, 2 = BG_NOISE (geometric-length burst of noisy bytes).
+    # 0 = BG, 1 = FG, 2 = BG_NOISE, 3 = PATTERN
     state = 0
     fg_base = 0
+    pat_idx = 0  # which pattern we're emitting
+    pat_pos = 0  # position within the current pattern
     U = float(0xFFFFFFFF)
     span_fg = max(1, fg_hi - fg_lo + 1)
     jitter_span = 2 * fg_jitter + 1
     for i in range(length):
         if state == 0:
-            # Clean BG. Emit 255, optionally start FG or BG_NOISE.
-            # Branch order MUST match Rust: FG check first, burst
-            # second. The probabilities are small enough that ordering
-            # rarely matters for metrics, but byte equivalence
-            # depends on it.
+            # Clean BG. Emit 255, optionally start FG/PATTERN or BG_NOISE.
             out[i] = 255
             if (rng.next() / U) < p_bf:
-                state = 1
-                fg_base = fg_lo + (rng.next() % span_fg)
+                if patterns and (rng.next() / U) < pattern_frac:
+                    # Emit a pattern "glyph".
+                    state = 3
+                    pat_idx = rng.next() % n_patterns
+                    pat_pos = 0
+                else:
+                    state = 1
+                    fg_base = fg_lo + (rng.next() % span_fg)
             elif (rng.next() / U) < bg_burst_p:
                 state = 2
         elif state == 1:
@@ -131,11 +220,92 @@ def gen_markov(params, length, seed):
             out[i] = v
             if (rng.next() / U) < p_fb:
                 state = 0
-        else:
+        elif state == 2:
             # BG_NOISE: geometric-length run of uniform 0..=254 bytes.
             out[i] = rng.next() % 255  # 0..254, uniform; never 255
             if (rng.next() / U) < bg_burst_end_p:
                 state = 0
+        else:
+            # PATTERN: emit next byte of the chosen pattern.
+            out[i] = patterns[pat_idx][pat_pos]
+            pat_pos += 1
+            if pat_pos >= pattern_len:
+                state = 0
+    return bytes(out)
+
+
+def gen_photo(params, length, seed):
+    """Random-walk photo generator with flat-hold regions.
+    Mirrors Rust `generate_photo`.
+
+    Two modes per pixel:
+      WALK  — prev + uniform(-delta, +delta), producing smooth gradients
+      FLAT  — hold a constant value (no step), producing long identical runs
+
+    Real film scans alternate between textured regions (surface detail,
+    gradients) and flat regions (sky, space, shadows, overexposed areas).
+    The flat regions drive down entropy and up lzw_ratio; the walk
+    regions provide the short_copy-heavy LZW code profile.
+
+    Params:
+      walk_delta        max step per pixel in WALK mode
+      edge_p            prob of jumping to a random value (edge)
+      channels          1 = grayscale, 3 = RGB (interleaved)
+      flat_p            prob per pixel of entering FLAT mode from WALK
+      flat_end_p        prob per pixel of leaving FLAT back to WALK
+      flat_val_lo       flat region holds a center value in [lo, hi]
+      flat_val_hi       (e.g. 0,5 for dark space; 250,255 for blown highlights)
+      flat_noise        per-pixel noise in flat mode: emit center ± uniform(-noise, +noise).
+                        Simulates film grain on dark backgrounds. Breaks KwKwK runs
+                        (real film "black" is never truly constant) and reduces the
+                        compression-ratio overshoot from pure-constant flat regions.
+    """
+    walk_delta = params["walk_delta"]
+    edge_p = params["edge_p"]
+    channels = max(1, params.get("channels", 1))
+    flat_p = params.get("flat_p", 0.0)
+    flat_end_p = params.get("flat_end_p", 0.0)
+    flat_val_lo = params.get("flat_val_lo", 0)
+    flat_val_hi = params.get("flat_val_hi", 5)
+    flat_noise = params.get("flat_noise", 0)
+
+    rng = Rng(seed)
+    out = bytearray(length)
+    U = float(0xFFFFFFFF)
+    delta_span = 2 * walk_delta + 1
+    flat_val_span = max(1, flat_val_hi - flat_val_lo + 1)
+    noise_span = 2 * flat_noise + 1
+
+    val = [128] * 3
+    flat = [False] * 3
+    flat_hold = [0] * 3  # center value during flat mode
+    i = 0
+    while i < length:
+        for ch in range(channels):
+            if i >= length:
+                break
+            if flat[ch]:
+                # FLAT mode: emit center ± noise, maybe exit.
+                if flat_noise > 0:
+                    noise = (rng.next() % noise_span) - flat_noise
+                    v = max(0, min(255, flat_hold[ch] + noise))
+                else:
+                    v = flat_hold[ch]
+                out[i] = v
+                if (rng.next() / U) < flat_end_p:
+                    flat[ch] = False
+                    val[ch] = flat_hold[ch]  # resume walk from center
+            else:
+                # WALK mode: edge jump, walk step, maybe enter flat.
+                if (rng.next() / U) < edge_p:
+                    val[ch] = rng.next() % 256
+                step = (rng.next() % delta_span) - walk_delta
+                val[ch] = max(0, min(255, val[ch] + step))
+                out[i] = val[ch]
+                if (rng.next() / U) < flat_p:
+                    flat[ch] = True
+                    flat_hold[ch] = flat_val_lo + (rng.next() % flat_val_span)
+            i += 1
     return bytes(out)
 
 
