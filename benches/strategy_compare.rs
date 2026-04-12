@@ -1,20 +1,31 @@
 //! Benchmark comparing Classic vs Streaming decode strategies.
 //! Run with: `cargo bench --bench strategy_compare`
 //!
-//! Synthetic data generators fitted to real-world LZW workloads via
-//! K-means clustering (k=5) on 49 real TIFF files from 5 corpora
-//! (TIFF conformance, QOI screenshots, gb82-sc screenshots, CLIC
-//! photos with/without predictor), followed by Nelder-Mead parameter
-//! optimization per cluster centroid.
+//! Synthetic data generators fitted to real-world LZW workloads. The
+//! current archetypes target scanned document imaging — specifically
+//! the RVL-CDIP test2 slice (50 email + 50 form from
+//! `chainyo/rvl-cdip` test-00002-of-00015.parquet), measured by
+//! `tools/analyze_scanned_pages.py`. See
+//! `docs/rvl-cdip-test2-analysis.md` for the analysis.
 //!
-//! Each archetype's generator parameters (palette_size, run_mean,
-//! nearby_prob, nearby_range) were fitted to minimize the distance
-//! between the generated data's feature vector [entropy, log(run),
-//! repeat_frac, mean_abs_delta] and the cluster centroid, plus the
-//! log-ratio of LZW compression ratios.
+//! Two-state Markov process (BG white + FG ink):
+//!   1. BG state emits byte 255 most of the time, with a small chance
+//!      of emitting a uniform random non-255 byte (scanner sensor noise
+//!      — this is what makes every real scan have distinct_values=256
+//!      even on blank pages).
+//!   2. With probability `p_bg_to_fg`, transition to FG and pick an ink
+//!      base byte uniformly from [fg_lo, fg_hi].
+//!   3. FG state emits `fg_base + uniform(-jitter, +jitter)` so ink
+//!      stretches share a narrow tone (antialiasing / gradient banding),
+//!      which LZW can compress into short dictionary patterns.
+//!   4. With probability `p_fg_to_bg`, return to BG.
 //!
-//! No external files needed. See wuffs-bench/examples/fit_archetypes.rs
-//! on the wuffs-parity investigation branch for the fitting code.
+//! Parameters were fitted in `tools/fit_generator.py` by a grid search
+//! that measures each trial via Pillow TIFF-LZW re-encode and matches
+//! the class medians of entropy, repeat_frac, rl_mean, rl_long_frac,
+//! mode_frac, and lzw_ratio. Every fitted archetype is within ±13% on
+//! each axis (most within ±2%); see the fit report printed by
+//! `tools/fit_generator.py` and the per-archetype comment blocks below.
 
 use std::sync::Arc;
 use weezl::{
@@ -58,27 +69,31 @@ fn decode_all(
 }
 
 // ---------------------------------------------------------------------------
-// Parameterized generator — one function covers all archetypes.
-//
-// Parameters fitted via Nelder-Mead to each K-means cluster centroid.
-// The generator produces bytes via a run-based process:
-//   1. Emit `run_len` copies of the current value (geometric distribution)
-//   2. Switch: with probability `nearby_prob`, jump by ±nearby_range;
-//      otherwise, pick a random value from 0..palette_size.
-//   3. Repeat.
-//
-// This simple process is enough to reproduce the entropy, run-length
-// distribution, repeat fraction, and compression ratio of each cluster.
+// Two-state Markov generator (BG white + FG ink) with scanner-noise model.
 // ---------------------------------------------------------------------------
+//
+// See tools/fit_generator.py for the Python reference implementation —
+// the two share the same xorshift32 sequence and the same branching
+// structure, so Rust output matches what the fitter measured.
 
 struct GenParams {
-    palette_size: u16,
-    run_mean: f64,
-    nearby_prob: f64,
-    nearby_range: u8,
+    /// Probability, per BG pixel, of transitioning BG → FG.
+    p_bg_to_fg: f64,
+    /// Probability, per FG pixel, of transitioning FG → BG.
+    p_fg_to_bg: f64,
+    /// Probability, per BG pixel, of emitting a uniform-random byte in
+    /// 0..=254 instead of 255. Simulates scanner sensor noise; real
+    /// scans have distinct_values = 256 even on nearly-blank pages.
+    bg_noise_p: f64,
+    /// FG base byte picked once per FG stretch, uniform in [fg_lo, fg_hi].
+    fg_lo: u8,
+    fg_hi: u8,
+    /// FG pixels within a stretch are `fg_base + uniform(-jitter, +jitter)`,
+    /// clamped to 0..=255. Controls how much LZW can compress ink runs.
+    fg_jitter: u8,
 }
 
-/// xorshift32 PRNG — deterministic, no deps.
+/// xorshift32 PRNG — deterministic, no deps. Must match tools/fit_generator.py.
 struct Rng(u32);
 impl Rng {
     fn new(seed: u32) -> Self {
@@ -94,83 +109,119 @@ impl Rng {
 
 fn generate(params: &GenParams, len: usize, seed: u32) -> Vec<u8> {
     let mut rng = Rng::new(seed);
-    let pal = params.palette_size.clamp(1, 256) as u32;
-    let run_mean = params.run_mean.max(1.0);
-    let p = 1.0 / run_mean;
+    let u = u32::MAX as f64;
+    let fg_lo = params.fg_lo as i16;
+    let fg_hi = params.fg_hi as i16;
+    let fg_span = (fg_hi - fg_lo + 1).max(1) as u32;
+    let jitter = params.fg_jitter as i16;
+    let jitter_span = (2 * jitter + 1).max(1) as u32;
 
     let mut out = Vec::with_capacity(len);
-    let mut val = (rng.next() % pal) as u8;
+    let mut state = 0u8; // 0 = BG, 1 = FG
+    let mut fg_base: i16 = 0;
 
     while out.len() < len {
-        // Geometric run length
-        let mut run = 1usize;
-        while (rng.next() as f64 / u32::MAX as f64) > p && run < len {
-            run += 1;
-        }
-        for _ in 0..run.min(len - out.len()) {
-            out.push(val);
-        }
-        // Switch
-        if (rng.next() as f64 / u32::MAX as f64) < params.nearby_prob {
-            let range = params.nearby_range.max(1) as i16;
-            let delta = (rng.next() % (2 * range as u32 + 1)) as i16 - range;
-            val = (val as i16 + delta).clamp(0, (pal as i16 - 1).min(255)) as u8;
+        if state == 0 {
+            // BG: mostly 255, rarely a uniform-random non-255 byte.
+            let byte = if (rng.next() as f64 / u) < params.bg_noise_p {
+                (rng.next() % 255) as u8 // 0..=254
+            } else {
+                255
+            };
+            out.push(byte);
+            if (rng.next() as f64 / u) < params.p_bg_to_fg {
+                state = 1;
+                fg_base = fg_lo + (rng.next() % fg_span) as i16;
+            }
         } else {
-            val = (rng.next() % pal) as u8;
+            // FG: ink tone with jitter around the stretch's base.
+            let delta = (rng.next() % jitter_span) as i16 - jitter;
+            let v = (fg_base + delta).clamp(0, 255) as u8;
+            out.push(v);
+            if (rng.next() as f64 / u) < params.p_fg_to_bg {
+                state = 0;
+            }
         }
     }
     out
 }
 
 // ---------------------------------------------------------------------------
-// Fitted archetypes — parameters from Nelder-Mead optimization.
+// Fitted archetypes — RVL-CDIP scanned documents (test2 slice).
 //
-// Cluster │ Archetype          │ Files │ Target                        │ Fitted
-// ────────┼────────────────────┼───────┼───────────────────────────────┼────────────
-//  0      │ Flat UI / palette  │ 14    │ H=1.07 run=28 rep=91% r=25x  │ r=26x ±5%
-//  1      │ Rich screenshot    │  8    │ H=2.58 run=3  rep=66% r=4.1x │ r=4.1x ±0%
-//  2      │ Photo + predictor  │ 11    │ H=4.15 run=2  rep=36% r=1.9x │ r=1.9x ±0%
-//  4      │ Photo raw / random │ 13    │ H=6.71 run=1  rep=8%  r=1.1x │ r=0.9x ±15%
+// Targets are medians over a 50-file slice per class / bucket, measured
+// with `tools/analyze_scanned_pages.py` (byte entropy, repeat fraction,
+// run-length mean + long_frac, mode fraction, Pillow TIFF-LZW ratio).
+// Parameters were fitted with `tools/fit_generator.py --length 262144`.
 //
-// Cluster 3 (3 unusual files: cmyk, tiny hpredict, issue_69) merged into
-// cluster 2 — too few files for a meaningful archetype.
+// Fit quality (measured at len=262144, seed=0xDEADBEEF, same generator
+// as the one below):
+//
+//   archetype         metric           target   measured  rel_err
+//   SCANNED_EMAIL     entropy          0.394    0.390     1.1%
+//                     repeat_frac      0.968    0.968     0.0%
+//                     rl_mean         31.28    31.16      0.4%
+//                     rl_long_frac     0.964    0.970     0.7%
+//                     mode_frac        0.972    0.972     0.0%
+//                     lzw_ratio       22.10    21.62      2.2%
+//   SCANNED_BLANK     entropy          0.123    0.107    13.0%
+//                     repeat_frac      0.991    0.991     0.0%
+//                     rl_mean        113.37   113.24      0.1%
+//                     rl_long_frac     0.991    0.993     0.2%
+//                     mode_frac        0.992    0.993     0.1%
+//                     lzw_ratio       56.80    56.95      0.3%
+//   SCANNED_DENSE     entropy          1.115    1.063     4.7%
+//                     repeat_frac      0.894    0.895     0.2%
+//                     rl_mean          9.42     9.56      1.4%
+//                     rl_long_frac     0.876    0.897     2.4%
+//                     mode_frac        0.912    0.913     0.1%
+//                     lzw_ratio        7.30     7.28      0.3%
+//
+// All axes within ±13%; most within ±5%. Blank's 13% entropy miss is
+// because the generator models sensor noise as i.i.d. Bernoulli while
+// real scanners produce spatially-correlated noise that lifts the
+// byte histogram without breaking long runs as aggressively — fixing
+// this would need a second-order model (e.g. block-level noise).
 // ---------------------------------------------------------------------------
 
-/// Cluster 0: Flat UI / palette — terminals, settings, simple web pages.
-/// 14 real files. H≈1.1, run≈28, rep≈91%, ratio≈25×.
-const FLAT_UI: GenParams = GenParams {
-    palette_size: 2,
-    run_mean: 14.6,
-    nearby_prob: 0.805,
-    nearby_range: 7,
+/// Email class median (n=50). Target: H≈0.39, rl=31, mode=0.972, ratio≈22×.
+/// Models typical text document with ~3% ink coverage and short dark
+/// antialiased glyphs on a clean white background.
+const SCANNED_EMAIL: GenParams = GenParams {
+    p_bg_to_fg: 0.0070,
+    p_fg_to_bg: 0.25,
+    bg_noise_p: 0.0004,
+    fg_lo: 0,
+    fg_hi: 150,
+    fg_jitter: 3,
 };
 
-/// Cluster 1: Rich screenshot — complex web pages, IDEs, dark themes.
-/// 8 real files. H≈2.6, run≈3, rep≈66%, ratio≈4.1×.
-const RICH_SCREENSHOT: GenParams = GenParams {
-    palette_size: 6,
-    run_mean: 2.4,
-    nearby_prob: 0.485,
-    nearby_range: 24,
+/// "Blank form" — median of the 15 form files with lzw_ratio ∈ [50, 80].
+/// Target: H≈0.12, rl=113, mode=0.992, ratio≈57×. Models a mostly-blank
+/// preprinted form with occasional faint rule lines or sparse text.
+/// Represents the high-compression tail where chunked/streaming decode
+/// tables matter most (long KwKwK runs of 255).
+const SCANNED_BLANK: GenParams = GenParams {
+    p_bg_to_fg: 0.0017,
+    p_fg_to_bg: 0.25,
+    bg_noise_p: 0.0008,
+    fg_lo: 0,
+    fg_hi: 120,
+    fg_jitter: 12,
 };
 
-/// Cluster 2: Photo with predictor — TIFF photos after horizontal
-/// differencing, complex web pages with gradients. 11 real files.
-/// H≈4.2, run≈1.6, rep≈36%, ratio≈1.9×.
-const PHOTO_PREDICTED: GenParams = GenParams {
-    palette_size: 16,
-    run_mean: 1.4,
-    nearby_prob: 0.376,
-    nearby_range: 19,
-};
-
-/// Cluster 4: Photo raw / near-random — uncompressed photos, high entropy.
-/// LZW typically expands these. 13 real files. H≈6.7, run≈1, rep≈8%, ratio≈1.1×.
-const PHOTO_RAW: GenParams = GenParams {
-    palette_size: 140,
-    run_mean: 1.0,
-    nearby_prob: 0.490,
-    nearby_range: 128,
+/// "Dense" document — e.g. email_003 (heavy text, low ratio).
+/// Target: H≈1.12, rl=9.4, mode=0.91, ratio≈7.3×. Models a page with
+/// ~9% ink coverage — dense paragraph text, filled form fields, or a
+/// scanned letter with small type. Represents the low-compression
+/// tail where the chunked table's extra bookkeeping is pure overhead.
+const SCANNED_DENSE: GenParams = GenParams {
+    p_bg_to_fg: 0.02325,
+    p_fg_to_bg: 0.25,
+    bg_noise_p: 0.0021,
+    fg_lo: 0,
+    fg_hi: 150,
+    fg_jitter: 6,
 };
 
 // ---------------------------------------------------------------------------
@@ -241,42 +292,36 @@ fn bench_strategies(suite: &mut Suite) {
     let seed = 0xDEADBEEF;
 
     let workloads = vec![
-        // MSB + TIFF — image-tiff configuration (4 fitted archetypes + solid)
+        // MSB + TIFF — image-tiff configuration. Three scanned-document
+        // archetypes spanning the range of real RVL-CDIP content:
+        // blank (rare, max compression) / email (class median) /
+        // dense (low-compression text-heavy tail). Plus a solid-color
+        // KwKwK baseline to stress the hottest decode path.
         make_workload(
-            "flat-ui",
-            &generate(&FLAT_UI, size, seed),
+            "scanned-email",
+            &generate(&SCANNED_EMAIL, size, seed),
             BitOrder::Msb,
             true,
         ),
         make_workload(
-            "rich-screenshot",
-            &generate(&RICH_SCREENSHOT, size, seed),
+            "scanned-blank",
+            &generate(&SCANNED_BLANK, size, seed),
             BitOrder::Msb,
             true,
         ),
         make_workload(
-            "photo-predicted",
-            &generate(&PHOTO_PREDICTED, size, seed),
-            BitOrder::Msb,
-            true,
-        ),
-        make_workload(
-            "photo-raw",
-            &generate(&PHOTO_RAW, size, seed),
+            "scanned-dense",
+            &generate(&SCANNED_DENSE, size, seed),
             BitOrder::Msb,
             true,
         ),
         make_workload("solid-kwkwk", &vec![42u8; size], BitOrder::Msb, true),
-        // LSB — GIF configuration (subset of archetypes)
+        // LSB — GIF configuration. Only the email archetype, since GIF
+        // consumers hit the same byte-255-dominated distribution when
+        // decoding scanned-document GIFs exported from TIFF pipelines.
         make_workload(
-            "flat-ui",
-            &generate(&FLAT_UI, size, seed),
-            BitOrder::Lsb,
-            false,
-        ),
-        make_workload(
-            "rich-screenshot",
-            &generate(&RICH_SCREENSHOT, size, seed),
+            "scanned-email",
+            &generate(&SCANNED_EMAIL, size, seed),
             BitOrder::Lsb,
             false,
         ),
