@@ -612,6 +612,64 @@ const PHOTO_COLOR: PhotoParams = PhotoParams {
 };
 
 // ---------------------------------------------------------------------------
+// Flat-UI GIF generator — palette-indexed block structure.
+// ---------------------------------------------------------------------------
+
+/// Generate a flat-UI-style byte stream: palette-indexed values (0-63),
+/// rectangular blocks of solid color with sharp edges. Simulates
+/// screenshots, UI mockups, and flat-design graphics — the dominant
+/// real-world GIF workload. Produces high compression ratios (~15-30×),
+/// mostly long copies from repeated block rows, and some KwKwK from
+/// solid regions.
+fn generate_flat_ui(len: usize, seed: u32) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let width = 640; // typical UI screenshot width
+    let palette_size = 32u32;
+    let mut out = Vec::with_capacity(len);
+
+    // Generate a "screen" of rectangular color blocks, repeated row by row.
+    // Each block is a solid color spanning several columns and rows.
+    let mut row = vec![0u8; width];
+    let mut col = 0;
+    while col < width {
+        let color = (rng.next() % palette_size) as u8;
+        let block_w = 20 + (rng.next() % 120) as usize; // 20-140px wide
+        let end = (col + block_w).min(width);
+        for c in col..end {
+            row[c] = color;
+        }
+        col = end;
+    }
+
+    // Tile the row, occasionally changing some blocks (new "widget")
+    let mut rows_until_change = 10 + (rng.next() % 40) as usize;
+    while out.len() < len {
+        for &b in row.iter() {
+            if out.len() >= len {
+                break;
+            }
+            out.push(b);
+        }
+        rows_until_change -= 1;
+        if rows_until_change == 0 {
+            // Repaint some blocks
+            let n_changes = 1 + (rng.next() % 4) as usize;
+            for _ in 0..n_changes {
+                let start = (rng.next() % width as u32) as usize;
+                let bw = 20 + (rng.next() % 120) as usize;
+                let color = (rng.next() % palette_size) as u8;
+                let end = (start + bw).min(width);
+                for c in start..end {
+                    row[c] = color;
+                }
+            }
+            rows_until_change = 10 + (rng.next() % 40) as usize;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Bench harness
 // ---------------------------------------------------------------------------
 
@@ -723,12 +781,22 @@ fn bench_strategies(suite: &mut Suite) {
             BitOrder::Msb,
             true,
         ),
-        // LSB — GIF configuration. Only the email archetype, since GIF
-        // consumers hit the same byte-255-dominated distribution when
-        // decoding scanned-document GIFs exported from TIFF pipelines.
+        // LSB — GIF configuration.
         make_workload(
             "scanned-email",
             &generate(&SCANNED_EMAIL, size, seed),
+            BitOrder::Lsb,
+            false,
+        ),
+        // Flat-UI GIF: palette-indexed (0-63), large solid-color blocks
+        // with sharp edges. Simulates screenshots, UI mockups, flat-design
+        // graphics. High compression ratio, mostly long copies from
+        // repeated UI elements. This is the workload where the KwKwK
+        // optimization's `last_decoded` bookkeeping was observed to
+        // regress the COPY hot path by 5-7% in earlier iterations.
+        make_workload(
+            "flat-ui",
+            &generate_flat_ui(size, seed),
             BitOrder::Lsb,
             false,
         ),
