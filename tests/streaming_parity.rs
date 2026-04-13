@@ -483,3 +483,64 @@ fn parity_large_kwkwk() {
         assert_parity(&data, order, 8, false, false, 8192);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for yield_on_full correctness (issue #68)
+//
+// The ByteLink burst decoder's relaxed overwrite (reconstruct_simple) writes
+// 8-byte aligned chunks that can clobber bytes past the code length. With
+// yield_on_full_buffer(true), the decoder may return before subsequent codes
+// overwrite those bytes, causing output divergence vs Streaming.
+//
+// The fuzz corpus input that exposed this: size=7, MSB, no tiff,
+// yield_on_full=true, payload of repeating 0x4A with 0x7F runs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regression_yield_on_full_fuzz_crash() {
+    // Minimized from fuzz/regression/yield_on_full_bytelink_divergence_min.bin
+    // Control byte 0x2c → size=7, MSB, not tiff, yield_on_full=true
+    let payload: &[u8] = &[
+        126, 36, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74,
+        74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 126, 44, 74, 74, 74, 74, 74, 74, 74, 74, 74,
+        127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+        127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+        127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74,
+        74, 74, 74, 74, 74, 74, 74, 74, 74, 126, 44,
+    ];
+    // Large output buffer — exposes the pre-existing issue #68 divergence
+    assert_parity(payload, BitOrder::Msb, 7, false, true, 8192);
+}
+
+#[test]
+fn regression_yield_on_full_small_buffer() {
+    // Same data but with a small output buffer (1..64 bytes) — exercises
+    // the yield_on_full suspension/resume path more aggressively. The
+    // reconstruct_simple overwrite is most dangerous with buffers just
+    // slightly larger than a code's output length.
+    let payload: &[u8] = &[
+        126, 36, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74,
+        74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74, 126, 44, 74, 74, 74, 74, 74, 74, 74, 74, 74,
+        127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+        127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+        127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 74, 74, 74, 74, 74, 74, 74, 74, 74, 74,
+        74, 74, 74, 74, 74, 74, 74, 74, 74, 126, 44,
+    ];
+    for buf_size in [1, 3, 7, 8, 9, 13, 15, 16, 17, 32, 64] {
+        assert_parity(payload, BitOrder::Msb, 7, false, true, buf_size);
+    }
+}
+
+#[test]
+fn regression_yield_on_full_sweep_sizes() {
+    // The bug is not specific to size=7. Test yield_on_full parity
+    // across all code sizes with data patterns that trigger long codes.
+    for size in 2..=12u8 {
+        let data = ramp(256, size);
+        for buf_size in [1, 7, 8, 9, 16, 64, 256] {
+            assert_parity(&data, BitOrder::Msb, size, false, true, buf_size);
+            assert_parity(&data, BitOrder::Lsb, size, false, true, buf_size);
+            assert_parity(&data, BitOrder::Msb, size, true, true, buf_size);
+        }
+    }
+}
