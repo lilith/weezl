@@ -201,8 +201,7 @@ const MASK: usize = MAX_ENTRIES - 1;
 #[derive(Clone, Copy, Debug, Default)]
 pub enum TableStrategy {
     /// Classic 6-wide burst decoder with compact 4-byte-per-entry table
-    /// (24 KB). This is the default, matching weezl's existing behavior.
-    #[default]
+    /// (24 KB). Matches weezl's pre-Streaming behavior.
     Classic,
     /// Streaming single-code-per-iteration decoder with a PreQ+SufQ(Q=8)
     /// table and a mini-burst fast path for consecutive literals or
@@ -230,6 +229,7 @@ pub enum TableStrategy {
     /// reuse a single decoder across many strips or frames pay the
     /// allocation cost only once. This matters most on Windows where
     /// `HeapAlloc` is ~5× slower than glibc malloc.
+    #[default]
     Streaming,
 }
 
@@ -252,7 +252,7 @@ impl Configuration {
             size,
             tiff: false,
             yield_on_full: false,
-            strategy: TableStrategy::Classic,
+            strategy: TableStrategy::default(),
         }
     }
 
@@ -264,7 +264,7 @@ impl Configuration {
             size,
             tiff: true,
             yield_on_full: false,
-            strategy: TableStrategy::Classic,
+            strategy: TableStrategy::default(),
         }
     }
 
