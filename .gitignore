@@ -1,2 +1,5 @@
 target
 Cargo.lock
+__pycache__/
+fuzz-0.log
+.workongoing
