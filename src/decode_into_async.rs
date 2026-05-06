@@ -1,4 +1,5 @@
 use crate::decode::IntoAsync;
+use crate::error::LzwError;
 use crate::error::LzwStatus;
 use crate::error::StreamResult;
 use crate::StreamBuf;
@@ -65,6 +66,7 @@ impl<'d, W: futures::io::AsyncWrite + core::marker::Unpin> IntoAsync<'d, W> {
 
         let mut bytes_read = 0;
         let mut bytes_written = 0;
+        let max_output_bytes = decoder.max_output_bytes;
 
         // Converting to mutable refs to move into the `once` closure.
         let read_bytes = &mut bytes_read;
@@ -85,8 +87,24 @@ impl<'d, W: futures::io::AsyncWrite + core::marker::Unpin> IntoAsync<'d, W> {
                 Err(err) => break Err(err),
             };
 
+            // Clamp the per-call output slice if a max_output_bytes cap is configured.
+            let outbuf_slice: &mut [u8] = match max_output_bytes {
+                Some(cap) if *write_bytes >= cap => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        &*format!("{:?}", LzwError::OutputCapExceeded),
+                    ));
+                }
+                Some(cap) => {
+                    let remaining = cap - *write_bytes;
+                    let len = outbuf.len().min(remaining);
+                    &mut outbuf[..len]
+                }
+                None => &mut outbuf[..],
+            };
+
             // Decode as much of the buffer as fits.
-            let result = decoder.decode_bytes(data, &mut outbuf[..]);
+            let result = decoder.decode_bytes(data, outbuf_slice);
             // Do the bookkeeping and consume the buffer.
             *read_bytes += result.consumed_in;
             *write_bytes += result.consumed_out;

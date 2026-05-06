@@ -1,3 +1,19 @@
+## Unreleased
+
+- Added `decode::Configuration::with_max_output_bytes(usize)` to cap the total decoded
+  output size for the convenience adapters (`Decoder::decode`, `IntoVec`, `IntoStream`,
+  `IntoAsync`). Crossing the cap returns the new `LzwError::OutputCapExceeded` variant.
+  The default (`None`) preserves previous behavior. Recommended for decoders that operate
+  on untrusted input — LZW can expand a small payload by a factor of ~1000× in worst-case
+  crafted streams. The sans-IO `decode_bytes` API is naturally bounded by the caller's
+  output slice and ignores the cap.
+- Lowered the default `STREAM_BUF_SIZE` for `IntoStream`/`IntoAsync` from 16 MiB to 64
+  KiB. Callers that prefer the larger buffer can call `set_buffer_size(1 << 24)` to
+  restore the previous default.
+- Documented that the decoder always produces `u8` output: for `min_size > 8`, literal
+  codes ≥ 256 are silently truncated. Conforming encoders for `min_size > 8` would not
+  emit such codes; malformed or adversarial streams can.
+
 ## Version 0.1.12
 
 - Further adjusted a debug assertion for TIFF compatibility. It still had one

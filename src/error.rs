@@ -61,12 +61,25 @@ pub enum LzwError {
     /// decoding stages. For compression this refers to a byte that has no code representation due
     /// to being larger than permitted by the `size` parameter given to the Encoder.
     InvalidCode,
+    /// The decoded output would exceed the configured maximum size.
+    ///
+    /// Set via [`Configuration::with_max_output_bytes`]. Used to harden decoders against
+    /// decompression-bomb inputs where a small compressed payload expands into a very large
+    /// output. Returned only by the convenience adapters that grow an output buffer themselves
+    /// (`IntoVec` and `IntoStream`); the sans-IO `decode_bytes` API is naturally bounded by the
+    /// caller-supplied output slice and never returns this variant.
+    ///
+    /// [`Configuration::with_max_output_bytes`]: crate::decode::Configuration::with_max_output_bytes
+    OutputCapExceeded,
 }
 
 impl core::fmt::Display for LzwError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             LzwError::InvalidCode => f.write_str("invalid code in LZW stream"),
+            LzwError::OutputCapExceeded => {
+                f.write_str("decoded output exceeded the configured maximum size")
+            }
         }
     }
 }

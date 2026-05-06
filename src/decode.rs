@@ -31,6 +31,12 @@ use std::io::{self, BufRead, Write};
 /// [`into_vec`]: #method.into_vec
 pub struct Decoder {
     state: Box<dyn Stateful + Send + 'static>,
+    /// Maximum total decoded output bytes for the convenience adapters
+    /// ([`Decoder::decode`], [`IntoVec`], [`IntoStream`]). `None` means no cap (preserves
+    /// pre-existing behavior). Set via [`Configuration::with_max_output_bytes`]. The
+    /// sans-IO [`Decoder::decode_bytes`] API is naturally bounded by the caller's slice
+    /// and ignores this field.
+    max_output_bytes: Option<usize>,
 }
 
 /// A decoding stream sink.
@@ -184,12 +190,22 @@ struct Table {
 }
 
 /// Describes the static parameters for creating a decoder.
+///
+/// # Symbol size and literal codes
+///
+/// The decoder produces `u8` output regardless of `size`. For `size > 8` (the standard LZW
+/// alphabet is 8-bit and most real-world callers — GIF, TIFF, PDF — use `size <= 8`) any
+/// literal code with value `>= 256` is silently truncated to its low 8 bits. Conforming
+/// encoders for `size > 8` would not emit such codes, but a malformed or adversarial stream
+/// can; the decoder does not flag this. If you operate on untrusted streams with `size > 8`
+/// and need strict conformance, validate codes externally or stick to `size <= 8`.
 #[derive(Clone, Debug)]
 pub struct Configuration {
     order: BitOrder,
     size: u8,
     tiff: bool,
     yield_on_full: bool,
+    max_output_bytes: Option<usize>,
 }
 
 impl Configuration {
@@ -201,6 +217,7 @@ impl Configuration {
             size,
             tiff: false,
             yield_on_full: false,
+            max_output_bytes: None,
         }
     }
 
@@ -212,6 +229,7 @@ impl Configuration {
             size,
             tiff: true,
             yield_on_full: false,
+            max_output_bytes: None,
         }
     }
 
@@ -234,10 +252,31 @@ impl Configuration {
         }
     }
 
+    /// Cap the total decoded output size for convenience adapters.
+    ///
+    /// When set, [`Decoder::decode`], [`IntoVec`], and [`IntoStream`] will stop and return
+    /// [`LzwError::OutputCapExceeded`] once the total written output for the call exceeds
+    /// `max_bytes`. The decoder may produce *up to* `max_bytes` of valid output before the
+    /// error; partial output is preserved in the destination buffer/writer. Subsequent
+    /// `decode_*` calls on the same `Decoder` reset the cap accounting (each top-level call
+    /// is bounded independently).
+    ///
+    /// Default: `None` (no cap), which preserves prior behavior. Setting an explicit cap is
+    /// strongly recommended when decoding untrusted input — LZW can expand a small payload
+    /// by a factor of ~1000× in worst-case crafted streams. The sans-IO
+    /// [`Decoder::decode_bytes`] API is bounded by the caller's slice and ignores this cap.
+    pub fn with_max_output_bytes(self, max_bytes: usize) -> Self {
+        Configuration {
+            max_output_bytes: Some(max_bytes),
+            ..self
+        }
+    }
+
     /// Create a new decoder with the define configuration.
     pub fn build(self) -> Decoder {
         Decoder {
             state: Decoder::from_configuration(&self),
+            max_output_bytes: self.max_output_bytes,
         }
     }
 }
@@ -483,6 +522,7 @@ impl<'d, W: Write> IntoStream<'d, W> {
 
         let mut bytes_read = 0;
         let mut bytes_written = 0;
+        let max_output_bytes = decoder.max_output_bytes;
 
         // Converting to mutable refs to move into the `once` closure.
         let read_bytes = &mut bytes_read;
@@ -499,8 +539,25 @@ impl<'d, W: Write> IntoStream<'d, W> {
             // Try to grab one buffer of input data.
             let data = read.fill_buf()?;
 
+            // Clamp the per-call output slice if a max_output_bytes cap is configured.
+            // Setting `cap_remaining = 0` immediately bails with OutputCapExceeded.
+            let outbuf_slice: &mut [u8] = match max_output_bytes {
+                Some(cap) if *write_bytes >= cap => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        &*format!("{:?}", LzwError::OutputCapExceeded),
+                    ));
+                }
+                Some(cap) => {
+                    let remaining = cap - *write_bytes;
+                    let len = outbuf.len().min(remaining);
+                    &mut outbuf[..len]
+                }
+                None => &mut outbuf[..],
+            };
+
             // Decode as much of the buffer as fits.
-            let result = decoder.decode_bytes(data, &mut outbuf[..]);
+            let result = decoder.decode_bytes(data, outbuf_slice);
             // Do the bookkeeping and consume the buffer.
             *read_bytes += result.consumed_in;
             *write_bytes += result.consumed_out;
@@ -573,15 +630,16 @@ impl IntoVec<'_> {
         self.decode_part(read, true)
     }
 
-    fn grab_buffer(&mut self) -> (&mut [u8], &mut Decoder) {
+    fn grab_buffer(&mut self, max_chunk: usize) -> (&mut [u8], &mut Decoder) {
         const CHUNK_SIZE: usize = 1 << 12;
+        let chunk = CHUNK_SIZE.min(max_chunk);
         let decoder = &mut self.decoder;
         let length = self.vector.len();
 
         // Use the vector to do overflow checks and w/e.
-        self.vector.reserve(CHUNK_SIZE);
+        self.vector.reserve(chunk);
         // FIXME: decoding into uninit buffer?
-        self.vector.resize(length + CHUNK_SIZE, 0u8);
+        self.vector.resize(length + chunk, 0u8);
 
         (&mut self.vector[length..], decoder)
     }
@@ -602,12 +660,24 @@ impl IntoVec<'_> {
         let read_bytes = &mut result.consumed_in;
         let write_bytes = &mut result.consumed_out;
         let mut data = part;
+        let max_output_bytes = self.decoder.max_output_bytes;
 
-        // A 64 MB buffer is quite large but should get alloc_zeroed.
-        // Note that the decoded size can be up to quadratic in code block.
+        // The decoded size can be up to quadratic in code block, so the convenience
+        // adapter grows the output vector chunk-by-chunk; an explicit cap (set via
+        // `Configuration::with_max_output_bytes`) hardens against decompression bombs.
         let once = move || {
-            // Grab a new output buffer.
-            let (outbuf, decoder) = self.grab_buffer();
+            // If a cap is set and we've already produced that much output, refuse to
+            // grow the vector further. Returning OutputCapExceeded here intentionally
+            // takes precedence over a possibly-imminent end-of-stream marker — the
+            // caller asked for a strict ceiling.
+            let remaining = match max_output_bytes {
+                Some(cap) if *write_bytes >= cap => return Err(LzwError::OutputCapExceeded),
+                Some(cap) => cap - *write_bytes,
+                None => usize::MAX,
+            };
+
+            // Grab a new output buffer (clamped to the remaining cap budget).
+            let (outbuf, decoder) = self.grab_buffer(remaining);
 
             // Decode as much of the buffer as fits.
             let result = decoder.decode_bytes(data, &mut outbuf[..]);
