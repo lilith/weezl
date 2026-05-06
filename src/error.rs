@@ -53,7 +53,11 @@ pub enum LzwStatus {
 }
 
 /// The error kind after unsuccessful coding of an LZW stream.
+///
+/// Marked `#[non_exhaustive]` so future error kinds can be added in additive
+/// (non-breaking) releases. Match with a `_ =>` arm or use `LzwError::Display`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum LzwError {
     /// The input contained an invalid code.
     ///
