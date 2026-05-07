@@ -88,5 +88,9 @@ required-features = ["std"]
 name = "end_of_buffer"
 required-features = ["alloc"]
 
+[[test]]
+name = "output_cap"
+required-features = ["alloc"]
+
 [package.metadata.docs.rs]
 all-features = true

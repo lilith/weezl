@@ -69,10 +69,13 @@ pub(crate) type Code = u16;
 
 /// A default buffer size for encoding/decoding buffer.
 ///
-/// Note that this is larger than the default size for buffers (usually 4K) since each code word
-/// can expand to multiple bytes. Expanding one buffer would yield multiple and require a costly
-/// break in the decoding loop. Note that the decoded size can be up to quadratic in code block.
-pub(crate) const STREAM_BUF_SIZE: usize = 1 << 24;
+/// 64 KiB is large enough to hold many full-depth (4096-byte) decoded codes per pass while
+/// keeping per-decoder memory low under concurrent use. Callers that decode large payloads
+/// in a single pass and want to avoid per-pass write callbacks can override this via
+/// [`decode::IntoStream::set_buffer_size`] or [`decode::IntoStream::set_buffer`]. The
+/// previous default was 16 MiB, which is decompression-bomb-relevant memory pressure when
+/// many decoders are constructed concurrently (e.g. one per request in a server).
+pub(crate) const STREAM_BUF_SIZE: usize = 1 << 16;
 
 /// The order of bits in bytes.
 #[derive(Clone, Copy, Debug)]
